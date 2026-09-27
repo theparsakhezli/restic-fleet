@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/<your-github-user>/restic-fleet/tree/main/docs
+    about: Setup, configuration, restoring and troubleshooting guides.

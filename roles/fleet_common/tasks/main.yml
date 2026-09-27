@@ -1,0 +1,24 @@
+---
+- name: Check the inventory layout
+  ansible.builtin.assert:
+    that:
+      - groups[fleet_server_group] | default([]) | length == 1
+      - groups[fleet_client_group] | default([]) | length >= 1
+    fail_msg: >-
+      The inventory needs exactly one host in '{{ fleet_server_group }}' and at least one
+      in '{{ fleet_client_group }}'.
+  run_once: true
+
+- name: Install base packages (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: "{{ fleet_packages_debian }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts.os_family == "Debian"
+
+- name: Install base packages (RHEL family)
+  ansible.builtin.dnf:
+    name: "{{ fleet_packages_redhat }}"
+    state: present
+  when: ansible_facts.os_family == "RedHat"

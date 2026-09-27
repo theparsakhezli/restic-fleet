@@ -1,0 +1,13 @@
+# A systemd-enabled Ubuntu "server" for end-to-end tests.
+FROM ubuntu:24.04
+ENV container=docker DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends systemd systemd-sysv openssh-server sudo python3 \
+      ca-certificates iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && systemctl enable ssh \
+ && useradd -m -s /bin/bash tester \
+ && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester \
+ && install -d -m 700 -o tester -g tester /home/tester/.ssh
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

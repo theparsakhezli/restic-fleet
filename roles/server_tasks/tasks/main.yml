@@ -1,0 +1,107 @@
+---
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ fleet_etc }}/repos", owner: root, group: restic, mode: "0750" }
+    - { path: "{{ fleet_cache_dir }}", owner: restic, group: restic, mode: "0750" }
+
+- name: Place repository passwords for server-side maintenance
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/repo-password/' ~ item ~ ' ' ~ fleet_secret_spec) }}"
+    dest: "{{ fleet_etc }}/repos/{{ item }}.pass"
+    owner: root
+    group: restic
+    mode: "0640"
+  loop: "{{ groups[fleet_client_group] }}"
+  no_log: true
+  when: fleet_server_maintenance | bool
+
+- name: Remove repository passwords (maintenance disabled)
+  ansible.builtin.file:
+    path: "{{ fleet_etc }}/repos/{{ item }}.pass"
+    state: absent
+  loop: "{{ groups[fleet_client_group] }}"
+  when: not (fleet_server_maintenance | bool)
+
+- name: Find repository passwords on the server
+  ansible.builtin.find:
+    paths: "{{ fleet_etc }}/repos"
+    patterns: ["*.pass"]
+  register: _repo_pass_files
+
+- name: Remove passwords of machines no longer in the inventory
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _repo_pass_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: (item.path | basename | regex_replace('\.pass$', '')) not in groups[fleet_client_group]
+
+- name: Place the server report token
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/server-report-token ' ~ fleet_secret_spec) }}"
+    dest: "{{ fleet_etc }}/server-report.token"
+    owner: root
+    group: restic
+    mode: "0640"
+  no_log: true
+
+- name: Write the server tasks configuration
+  ansible.builtin.copy:
+    content: "{{ _server_config | to_nice_json }}\n"
+    dest: "{{ fleet_etc }}/server.json"
+    owner: root
+    group: restic
+    mode: "0640"
+  vars:
+    _server_config:
+      data_dir: "{{ fleet_data_dir }}"
+      cache_dir: "{{ fleet_cache_dir }}"
+      repo_pass_dir: "{{ fleet_etc }}/repos"
+      token_file: "{{ fleet_etc }}/server-report.token"
+      dashboard_url: "https://127.0.0.1:{{ fleet_dashboard_port }}"
+      dashboard_cacert: "{{ fleet_tls_dir }}/ca.crt"
+      check_subset: "{{ fleet_check_subset }}"
+      retry_lock: "1h"
+      clients: >-
+        {{ dict(groups[fleet_client_group]
+                | zip(groups[fleet_client_group] | map('extract', hostvars, 'backup_retention')
+                      | map('default', fleet_retention))) }}
+
+- name: Install the server tasks script
+  ansible.builtin.copy:
+    src: restic-fleet-server
+    dest: /usr/local/sbin/restic-fleet-server
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - restic-fleet-collect.service
+    - restic-fleet-collect.timer
+    - restic-fleet-maintain.service
+    - restic-fleet-maintain.timer
+  register: _units
+
+- name: Enable timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: "{{ _units.changed }}"
+  loop:
+    - restic-fleet-collect.timer
+    - restic-fleet-maintain.timer

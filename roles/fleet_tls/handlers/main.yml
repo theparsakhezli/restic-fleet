@@ -1,0 +1,13 @@
+---
+# The services are defined by later roles; restarting a unit that isn't installed yet is a no-op.
+- name: Restart rest-server
+  ansible.builtin.systemd_service:
+    name: restic-fleet-rest-server.service
+    state: restarted
+  failed_when: false
+
+- name: Restart dashboard
+  ansible.builtin.systemd_service:
+    name: restic-fleet-dashboard.service
+    state: restarted
+  failed_when: false

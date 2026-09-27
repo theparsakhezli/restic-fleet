@@ -1,0 +1,2 @@
+---
+_is_ip: "{{ fleet_server_address is match('^[0-9.]+$') or ':' in fleet_server_address }}"

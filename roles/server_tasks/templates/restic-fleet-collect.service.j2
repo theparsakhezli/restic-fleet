@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet: collect repository statistics for the dashboard
+After=restic-fleet-dashboard.service
+
+[Service]
+Type=oneshot
+User=restic
+Group=restic
+ExecStart=/usr/local/sbin/restic-fleet-server collect
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+{% include 'hardening.j2' %}

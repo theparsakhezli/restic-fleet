@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet: collect repository statistics
+
+[Timer]
+OnCalendar={{ fleet_collect_schedule }}
+OnBootSec=2min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

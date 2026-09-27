@@ -1,0 +1,28 @@
+---
+# Installs the pinned restic release after verifying its SHA-256 (see fleet_restic_sha256).
+- name: Read the installed restic version
+  ansible.builtin.command: /usr/local/bin/restic version
+  register: _restic_version
+  changed_when: false
+  failed_when: false
+
+- name: Install restic {{ fleet_restic_version }}
+  when: ("restic " ~ fleet_restic_version ~ " ") not in (_restic_version.stdout | default(""))
+  block:
+    - name: Download restic (checksum verified)
+      ansible.builtin.get_url:
+        url: "https://github.com/restic/restic/releases/download/v{{ fleet_restic_version }}/restic_{{ fleet_restic_version }}_linux_{{ fleet_arch }}.bz2"
+        dest: "/root/.restic-{{ fleet_restic_version }}.bz2"
+        checksum: "sha256:{{ fleet_restic_sha256[fleet_arch] }}"
+        mode: "0600"
+
+    - name: Unpack and install restic atomically
+      ansible.builtin.shell: |
+        set -eu
+        bunzip2 -c /root/.restic-{{ fleet_restic_version }}.bz2 > /usr/local/bin/.restic.new
+        chmod 0755 /usr/local/bin/.restic.new
+        mv -f /usr/local/bin/.restic.new /usr/local/bin/restic
+        rm -f /root/.restic-{{ fleet_restic_version }}.bz2
+      args:
+        executable: /bin/sh
+      changed_when: true

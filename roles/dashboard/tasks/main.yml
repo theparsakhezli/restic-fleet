@@ -1,0 +1,123 @@
+---
+- name: Create the dashboard user
+  ansible.builtin.user:
+    name: rfdash
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/restic-fleet-dashboard
+    create_home: false
+    groups: ["{{ fleet_tls_group }}"]
+    append: true
+
+- name: Create dashboard directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /opt/restic-fleet, owner: root, mode: "0755" }
+    - { path: /var/lib/restic-fleet-dashboard, owner: rfdash, mode: "0700" }
+
+- name: Install the dashboard
+  ansible.builtin.copy:
+    src: restic_fleet_dashboard.py
+    dest: /opt/restic-fleet/restic_fleet_dashboard.py
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart dashboard
+
+- name: Install the dashboard's design assets (styles, script, logo)
+  ansible.builtin.copy:
+    src: static/
+    dest: /opt/restic-fleet/static/
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
+  notify: Restart dashboard
+
+# Only SHA-256 hashes of the tokens are stored on the server; the tokens themselves live on the
+# clients (and in the controller's credentials directory).
+- name: Build the client list for the dashboard
+  ansible.builtin.set_fact:
+    _dash_clients: >-
+      {{ _dash_clients | default({}) | combine({item: {
+           'token_sha256': lookup('ansible.builtin.password', fleet_credentials_dir ~ '/report-token/' ~ item ~ ' ' ~ fleet_secret_spec) | hash('sha256'),
+           'expected_interval_hours': hostvars[item].backup_interval_hours | default(fleet_backup_interval_hours) | float}}) }}
+  loop: "{{ groups[fleet_client_group] }}"
+  no_log: true
+
+- name: Write the dashboard configuration
+  ansible.builtin.copy:
+    content: "{{ _dashboard_config | to_nice_json }}\n"
+    dest: "{{ fleet_etc }}/dashboard.json"
+    owner: root
+    group: rfdash
+    mode: "0640"
+  vars:
+    _dashboard_config:
+      fleet_name: "{{ fleet_name }}"
+      listen: "{{ fleet_dashboard_listen }}"
+      port: "{{ fleet_dashboard_port | int }}"
+      tls_cert: "{{ fleet_tls_dir }}/server.crt"
+      tls_key: "{{ fleet_tls_dir }}/server.key"
+      trusted_proxy: "{{ fleet_dashboard_trusted_proxy | bool }}"
+      clients: "{{ _dash_clients }}"
+      server_token_sha256: >-
+        {{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/server-report-token ' ~ fleet_secret_spec) | hash('sha256') }}
+      metrics_token_sha256: >-
+        {{ (lookup('ansible.builtin.password', fleet_credentials_dir ~ '/metrics-token ' ~ fleet_secret_spec) | hash('sha256'))
+           if fleet_metrics_enabled | bool else '' }}
+      notify:
+        telegram_token: "{{ fleet_notify_telegram_token }}"
+        telegram_chat_ids: "{{ fleet_notify_telegram_chat_ids }}"
+        webhook_url: "{{ fleet_notify_webhook_url }}"
+  no_log: true
+  notify: Restart dashboard
+
+- name: Check the admin password
+  ansible.builtin.command:
+    cmd: python3 /opt/restic-fleet/restic_fleet_dashboard.py verify-password {{ fleet_dashboard_admin }}
+    stdin: "{{ _admin_password }}"
+  environment:
+    RFD_STATE_DIR: /var/lib/restic-fleet-dashboard
+  register: _admin_ok
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Set the admin password
+  ansible.builtin.command:
+    cmd: python3 /opt/restic-fleet/restic_fleet_dashboard.py set-password {{ fleet_dashboard_admin }}
+    stdin: "{{ _admin_password }}"
+  environment:
+    RFD_STATE_DIR: /var/lib/restic-fleet-dashboard
+  when: _admin_ok.rc != 0
+  changed_when: true
+  no_log: true
+
+- name: Keep the user file owned by the dashboard
+  ansible.builtin.file:
+    path: /var/lib/restic-fleet-dashboard/users.json
+    owner: rfdash
+    group: rfdash
+    mode: "0600"
+
+- name: Install the dashboard unit
+  ansible.builtin.template:
+    src: restic-fleet-dashboard.service.j2
+    dest: /etc/systemd/system/restic-fleet-dashboard.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart dashboard
+
+- name: Enable and start the dashboard
+  ansible.builtin.systemd_service:
+    name: restic-fleet-dashboard.service
+    enabled: true
+    state: started
+    daemon_reload: true

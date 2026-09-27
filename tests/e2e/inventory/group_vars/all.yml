@@ -1,0 +1,4 @@
+fleet_name: e2e-fleet
+fleet_randomized_delay: 1s
+fleet_manage_ufw: false
+fleet_metrics_enabled: true

@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet backup
+Documentation=man:restic(1)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/restic-fleet-backup
+# Stay out of the way of production workloads.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=12h
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictRealtime=yes
+LockPersonality=yes

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# rfleet - run restic against this host's backup repository with the fleet settings.
+#
+#   rfleet run                         start a backup now (in the background)
+#   rfleet status                      last run, next scheduled run
+#   rfleet logs                        output of the last runs
+#   rfleet snapshots                   list snapshots (files are tagged "files", each database
+#                                      dump with its job name)
+#   rfleet restore latest --tag files --target /tmp/restore [--include /etc/nginx]
+#   rfleet db mydb > mydb.sql          latest dump of database job "mydb" (add a snapshot ID
+#                                      for an older one: rfleet db mydb 1a2b3c4d > mydb.sql)
+#   rfleet <any restic command>        e.g. rfleet ls latest --tag files, rfleet mount /mnt/b
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo -- "$0" "$@"
+fi
+
+set -a
+# shellcheck source=/dev/null
+. /etc/restic-fleet/fleet.env
+set +a
+
+case "${1:-help}" in
+  run)
+    systemctl start --no-block restic-fleet-backup.service
+    echo "Backup started. Follow it with: rfleet logs -f" ;;
+  status)
+    systemctl status restic-fleet-backup.service --no-pager -n 0 || true
+    systemctl list-timers restic-fleet-backup.timer --no-pager ;;
+  logs)
+    shift
+    exec journalctl -u restic-fleet-backup.service --no-pager -n 200 "$@" ;;
+  db)
+    name=${2:?usage: rfleet db NAME [SNAPSHOT] > file}
+    [ -f "/etc/restic-fleet/dumps/$name.filename" ] || { echo "no database job named '$name'" >&2; exit 2; }
+    exec restic dump --tag "$name" "${3:-latest}" "/$(cat "/etc/restic-fleet/dumps/$name.filename")" ;;
+  help|-h|--help)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)
+    exec restic "$@" ;;
+esac

@@ -1,0 +1,99 @@
+---
+- name: Install htpasswd (bcrypt hashing for rest-server users)
+  ansible.builtin.package:
+    name: "{{ 'apache2-utils' if ansible_facts.os_family == 'Debian' else 'httpd-tools' }}"
+    state: present
+
+- name: Create the restic service user
+  ansible.builtin.user:
+    name: restic
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ fleet_data_dir }}"
+    create_home: false
+    groups: ["{{ fleet_tls_group }}"]
+    append: true
+
+- name: Create the repository directory
+  ansible.builtin.file:
+    path: "{{ fleet_data_dir }}"
+    state: directory
+    owner: restic
+    group: restic
+    mode: "0750"
+
+- name: Read the installed rest-server version
+  ansible.builtin.command: /usr/local/bin/rest-server --version
+  register: _rest_version
+  changed_when: false
+  failed_when: false
+
+- name: Install rest-server {{ fleet_rest_server_version }}
+  when: ("rest-server " ~ fleet_rest_server_version) not in (_rest_version.stdout | default(""))
+  block:
+    - name: Download rest-server (checksum verified)
+      ansible.builtin.get_url:
+        url: "https://github.com/restic/rest-server/releases/download/v{{ fleet_rest_server_version }}/{{ _rest_tarball }}"
+        dest: "/root/.{{ _rest_tarball }}"
+        checksum: "sha256:{{ fleet_rest_server_sha256[fleet_arch] }}"
+        mode: "0600"
+
+    - name: Install the rest-server binary atomically
+      ansible.builtin.shell: |
+        set -eu
+        tmp=$(mktemp -d)
+        tar -xzf /root/.{{ _rest_tarball }} -C "$tmp"
+        install -m 0755 "$tmp"/rest-server_*/rest-server /usr/local/bin/.rest-server.new
+        mv -f /usr/local/bin/.rest-server.new /usr/local/bin/rest-server
+        rm -rf "$tmp" /root/.{{ _rest_tarball }}
+      args:
+        executable: /bin/sh
+      changed_when: true
+      notify: Restart rest-server
+
+- name: Create the helper directory
+  ansible.builtin.file:
+    path: /usr/local/libexec/restic-fleet
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the htpasswd sync helper
+  ansible.builtin.copy:
+    src: htpasswd-sync
+    dest: /usr/local/libexec/restic-fleet/
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Sync one rest-server user per client (bcrypt; passwords never on the command line)
+  ansible.builtin.command:
+    cmd: /usr/local/libexec/restic-fleet/htpasswd-sync {{ fleet_etc }}/rest-server.htpasswd
+    stdin: |
+      {% for client in groups[fleet_client_group] %}
+      {{ client }} {{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/rest-password/' ~ client ~ ' ' ~ fleet_secret_spec) }}
+      {% endfor %}
+  register: _htpasswd
+  changed_when: "'CHANGED' in _htpasswd.stdout"
+  no_log: true
+
+- name: Install the rest-server unit
+  ansible.builtin.template:
+    src: restic-fleet-rest-server.service.j2
+    dest: /etc/systemd/system/restic-fleet-rest-server.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart rest-server
+
+- name: Enable and start rest-server
+  ansible.builtin.systemd_service:
+    name: restic-fleet-rest-server.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Firewall rules
+  ansible.builtin.include_tasks: ufw.yml
+  when: fleet_manage_ufw | bool

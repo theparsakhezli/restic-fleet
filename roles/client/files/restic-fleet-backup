@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# restic-fleet client backup. Installed by Ansible; configuration lives in /etc/restic-fleet.
+#
+# Jobs, in order:
+#   pre-hook   /etc/restic-fleet/hooks/pre   (optional; a failure aborts the run)
+#   files      paths in paths.txt (minus excludes.txt)
+#   db-<name>  one per dumps/<name>.sh, streamed straight into restic (no temp dump on disk)
+#   post-hook  /etc/restic-fleet/hooks/post  (optional)
+# Every job is reported to the dashboard. Exit status is non-zero if any job failed, so
+# systemd (and anything watching it) sees the failure too.
+set -Eeuo pipefail
+umask 077
+
+CONF=/etc/restic-fleet
+set -a
+# shellcheck source=/dev/null
+. "$CONF/fleet.env"
+set +a
+
+exec 9>/run/restic-fleet-backup.lock
+if ! flock -n 9; then
+  echo "another restic-fleet backup is already running; skipping" >&2
+  exit 0
+fi
+
+RUN_ID="$(date +%s)-$$"
+FAILED=0
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+report() {  # job status started [finished] [summary-json] [message]
+  [ -n "${FLEET_REPORT_URL:-}" ] || return 0
+  local summary=${5:-} payload
+  [ -n "$summary" ] || summary='{}'
+  payload=$(jq -cn --arg run "$RUN_ID" --arg job "$1" --arg st "$2" --argjson started "$3" \
+      --argjson finished "${4:-null}" --argjson s "$summary" --arg msg "${6:-}" \
+      '{run_id:$run, job:$job, status:$st, started:$started, finished:$finished, message:$msg,
+        data_added:$s.data_added, bytes_processed:$s.total_bytes_processed, files_new:$s.files_new,
+        files_changed:$s.files_changed, snapshot_id:$s.snapshot_id}')
+  curl -fsS --max-time 20 --retry 2 --retry-delay 3 --cacert "$RESTIC_CACERT" \
+       -H @"$CONF/report.header" -H 'Content-Type: application/json' \
+       --data-binary "$payload" "$FLEET_REPORT_URL" >/dev/null \
+    || echo "warning: could not report '$1' to the dashboard" >&2
+}
+
+run_job() {  # job-name restic-backup-args...
+  local job=$1 started finished rc summary status msg errors
+  shift
+  started=$(date +%s)
+  report "$job" running "$started"
+  set +e
+  restic backup --json --quiet --host "$FLEET_HOST" "$@" >"$TMP/out" 2>"$TMP/err"
+  rc=$?
+  set -e
+  finished=$(date +%s)
+  summary=$(jq -c 'select(.message_type == "summary")' "$TMP/out" 2>/dev/null | tail -n 1 || true)
+  errors=$( { jq -r 'select(.message_type == "error") | "\(.item // "") \(.error.message // .error // "")"' \
+                "$TMP/out" 2>/dev/null || true; cat "$TMP/err"; } | tail -c 1500)
+  case $rc in
+    0) status=success; msg="" ;;
+    3) status=warning; msg="some files could not be read: $errors" ;;
+    *) status=failed;  msg="restic exit $rc: $errors"; FAILED=1 ;;
+  esac
+  report "$job" "$status" "$started" "$finished" "$summary" "$msg"
+  printf '%-24s %s\n' "$job" "$status"
+  [ "$status" = success ] || printf '%s\n' "$msg" >&2
+}
+
+run_hook() {  # pre|post
+  local hook="$CONF/hooks/$1" started
+  [ -x "$hook" ] || return 0
+  started=$(date +%s)
+  if ! "$hook" >"$TMP/hook" 2>&1; then
+    report "$1-hook" failed "$started" "$(date +%s)" "" "$(tail -c 1500 "$TMP/hook")"
+    echo "$1-hook failed" >&2
+    return 1
+  fi
+}
+
+if ! run_hook pre; then
+  exit 1
+fi
+
+if [ -s "$CONF/paths.txt" ]; then
+  args=(--files-from "$CONF/paths.txt" --tag files)
+  [ -s "$CONF/excludes.txt" ] && args+=(--exclude-file "$CONF/excludes.txt")
+  [ "${FLEET_EXCLUDE_CACHES:-1}" = 1 ] && args+=(--exclude-caches)
+  [ "${FLEET_ONE_FILE_SYSTEM:-0}" = 1 ] && args+=(--one-file-system)
+  run_job files "${args[@]}"
+fi
+
+for dump in "$CONF"/dumps/*.sh; do
+  [ -e "$dump" ] || continue
+  name=$(basename "$dump" .sh)
+  filename="$name.sql"
+  [ -s "$CONF/dumps/$name.filename" ] && filename=$(<"$CONF/dumps/$name.filename")
+  # --stdin-from-command: restic reads the dump from the command's stdout and fails the
+  # snapshot if the command exits non-zero, so a broken dump is never stored as "success".
+  run_job "db-$name" --tag db --tag "$name" --stdin-filename "$filename" --stdin-from-command -- "$dump"
+done
+
+run_hook post || FAILED=1
+exit "$FAILED"

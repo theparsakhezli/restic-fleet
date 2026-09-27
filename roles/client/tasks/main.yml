@@ -1,0 +1,200 @@
+---
+- name: Validate this client's settings
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
+      - backup_paths is not string
+      - backup_excludes is not string
+      - backup_databases is not string
+      - (backup_paths | length > 0) or (backup_databases | length > 0)
+    fail_msg: >-
+      {{ inventory_hostname }}: the host name must be letters/digits/.-_ and the host needs
+      backup_paths and/or backup_databases (as YAML lists).
+    quiet: true
+
+- name: Validate database jobs
+  ansible.builtin.assert:
+    that:
+      - db.name is defined and db.name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$')
+      - db.type in ['postgres', 'mysql', 'mongodb', 'command']
+      - db.type != 'command' or (db.command | default('') | length > 0)
+      - db.database is not defined or db.database is match('^[A-Za-z0-9_$.-]+$')
+      - db.user is not defined or db.user is match('^[A-Za-z0-9_.-]+$')
+      - db.container is not defined or db.container is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+    fail_msg: >-
+      {{ inventory_hostname }}: database job {{ db.name | default('?') }} is invalid. Needs name,
+      type (postgres|mysql|mongodb|command); database/user/container may only contain letters,
+      digits and . _ - (command jobs need `command`).
+    quiet: true
+  loop: "{{ backup_databases }}"
+  loop_control:
+    loop_var: db
+    label: "{{ db.name | default('?') }}"
+
+- name: Create client directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ fleet_etc }}"
+    - "{{ fleet_etc }}/dumps"
+    - "{{ fleet_etc }}/hooks"
+    - "{{ fleet_cache_dir }}"
+
+- name: Install the fleet CA certificate (pins the backup server)
+  ansible.builtin.copy:
+    src: "{{ fleet_credentials_dir }}/ca.crt"
+    dest: "{{ fleet_etc }}/ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install secrets
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ fleet_etc }}/{{ item.file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - { file: repo.pass, content: "{{ _repo_password }}" }
+    - { file: report.header, content: "Authorization: Bearer {{ _report_token }}\n" }
+    - { file: fleet.env, content: "{{ lookup('ansible.builtin.template', 'fleet.env.j2') }}" }
+  loop_control:
+    label: "{{ item.file }}"
+  no_log: true
+
+- name: Write paths and excludes
+  ansible.builtin.copy:
+    content: "{{ (item.lines | join('\n') ~ '\n') if item.lines else '' }}"
+    dest: "{{ fleet_etc }}/{{ item.file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - { file: paths.txt, lines: "{{ backup_paths }}" }
+    - { file: excludes.txt, lines: "{{ fleet_default_excludes + backup_excludes }}" }
+  loop_control:
+    label: "{{ item.file }}"
+
+- name: Write database dump scripts
+  ansible.builtin.template:
+    src: dump.sh.j2
+    dest: "{{ fleet_etc }}/dumps/{{ db.name }}.sh"
+    owner: root
+    group: root
+    mode: "0700"
+  loop: "{{ backup_databases }}"
+  loop_control:
+    loop_var: db
+    label: "{{ db.name }}"
+
+- name: Write dump file names
+  ansible.builtin.copy:
+    content: "{{ db.filename | default(db.name ~ _dump_ext[db.type]) }}"
+    dest: "{{ fleet_etc }}/dumps/{{ db.name }}.filename"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ backup_databases }}"
+  loop_control:
+    loop_var: db
+    label: "{{ db.name }}"
+
+- name: Find dump scripts
+  ansible.builtin.find:
+    paths: "{{ fleet_etc }}/dumps"
+    patterns: ["*.sh", "*.filename"]
+  register: _dumps
+
+- name: Remove dump scripts for databases no longer in the inventory
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _dumps.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: (item.path | basename | regex_replace('\.(sh|filename)$', '')) not in (backup_databases | map(attribute='name'))
+
+- name: Install hooks
+  ansible.builtin.copy:
+    content: "#!/bin/sh\nset -eu\n{{ item.script }}\n"
+    dest: "{{ fleet_etc }}/hooks/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - { name: pre, script: "{{ backup_pre_hook }}" }
+    - { name: post, script: "{{ backup_post_hook }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.script | length > 0
+
+- name: Remove unused hooks
+  ansible.builtin.file:
+    path: "{{ fleet_etc }}/hooks/{{ item.name }}"
+    state: absent
+  loop:
+    - { name: pre, script: "{{ backup_pre_hook }}" }
+    - { name: post, script: "{{ backup_post_hook }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.script | length == 0
+
+- name: Install the backup script and the rfleet helper
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - { src: restic-fleet-backup, dest: /usr/local/sbin/restic-fleet-backup }
+    - { src: rfleet, dest: /usr/local/bin/rfleet }
+
+- name: Check whether the repository exists
+  ansible.builtin.command: /usr/local/bin/restic cat config
+  environment: "{{ _restic_env }}"
+  register: _repo
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Initialise the repository
+  ansible.builtin.command: /usr/local/bin/restic init
+  environment: "{{ _restic_env }}"
+  when: _repo.rc != 0
+  register: _init
+  changed_when: true
+  failed_when: _init.rc != 0
+  no_log: true
+
+- name: Install the backup unit and timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - restic-fleet-backup.service
+    - restic-fleet-backup.timer
+  register: _client_units
+
+- name: Enable the backup timer
+  ansible.builtin.systemd_service:
+    name: restic-fleet-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ _client_units.changed }}"
+
+- name: Start a backup now
+  ansible.builtin.systemd_service:
+    name: restic-fleet-backup.service
+    state: started
+    no_block: true
+  when: fleet_run_backup_now | bool
+  changed_when: true

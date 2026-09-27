@@ -1,0 +1,43 @@
+---
+# Only touches ufw if it is installed AND already active. It never enables a firewall,
+# so it can't lock anyone out of SSH.
+- name: Check whether ufw is active
+  ansible.builtin.command: ufw status
+  register: _ufw
+  changed_when: false
+  failed_when: false
+
+- name: Allow each client to reach rest-server
+  ansible.builtin.command:
+    cmd: >-
+      ufw allow from {{ hostvars[item].fleet_source_address | default(hostvars[item].ansible_host) }}
+      to any port {{ fleet_rest_port }} proto tcp comment "restic-fleet rest-server ({{ item }})"
+  loop: "{{ groups[fleet_client_group] }}"
+  register: _ufw_rest
+  changed_when: "'Rule added' in _ufw_rest.stdout"
+  when:
+    - "'Status: active' in _ufw.stdout"
+    - (hostvars[item].fleet_source_address | default(hostvars[item].ansible_host | default(''))) is match('^[0-9a-fA-F:.]+(/[0-9]+)?$')
+
+- name: Allow each client to report to the dashboard
+  ansible.builtin.command:
+    cmd: >-
+      ufw allow from {{ hostvars[item].fleet_source_address | default(hostvars[item].ansible_host) }}
+      to any port {{ fleet_dashboard_port }} proto tcp comment "restic-fleet dashboard ({{ item }})"
+  loop: "{{ groups[fleet_client_group] }}"
+  register: _ufw_report
+  changed_when: "'Rule added' in _ufw_report.stdout"
+  when:
+    - "'Status: active' in _ufw.stdout"
+    - "'any' not in fleet_dashboard_allow_from"
+    - (hostvars[item].fleet_source_address | default(hostvars[item].ansible_host | default(''))) is match('^[0-9a-fA-F:.]+(/[0-9]+)?$')
+
+- name: Allow people to open the dashboard
+  ansible.builtin.command:
+    cmd: >-
+      ufw allow from {{ item }} to any port {{ fleet_dashboard_port }} proto tcp comment "restic-fleet dashboard"
+  loop: >-
+    {{ fleet_dashboard_allow_from if 'any' not in fleet_dashboard_allow_from else ['any'] }}
+  register: _ufw_dash
+  changed_when: "'Rule added' in _ufw_dash.stdout"
+  when: "'Status: active' in _ufw.stdout"

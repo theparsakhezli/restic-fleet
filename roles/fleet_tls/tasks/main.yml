@@ -1,0 +1,83 @@
+---
+# A private CA on the backup server signs the server certificate. Clients pin that CA, so
+# rest-server and the dashboard use TLS without a public certificate or domain name.
+- name: Create the TLS group (rest-server and the dashboard read the key)
+  ansible.builtin.group:
+    name: "{{ fleet_tls_group }}"
+    system: true
+
+- name: Create configuration directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ fleet_etc }}", group: root, mode: "0755" }
+    - { path: "{{ fleet_tls_dir }}", group: "{{ fleet_tls_group }}", mode: "0750" }
+
+- name: Create the fleet CA (10 years, ECDSA P-256)
+  ansible.builtin.shell: |
+    set -eu
+    umask 077
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key
+    openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj "/CN={{ fleet_name }} CA" \
+      -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca.crt
+    chmod 0644 ca.crt
+  args:
+    chdir: "{{ fleet_tls_dir }}"
+    creates: "{{ fleet_tls_dir }}/ca.crt"
+    executable: /bin/sh
+
+- name: Check the server certificate (valid 30+ days, matches the address, signed by the CA)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    openssl x509 -in server.crt -noout -checkend 2592000 >/dev/null
+    openssl x509 -in server.crt -noout {{ _check_flag }} {{ fleet_server_address | quote }} | grep -q "does match"
+    openssl x509 -in server.crt -noout -checkip 127.0.0.1 | grep -q "does match"
+    openssl verify -CAfile ca.crt server.crt >/dev/null
+  args:
+    chdir: "{{ fleet_tls_dir }}"
+    executable: /bin/bash
+  vars:
+    _check_flag: "{{ '-checkip' if _is_ip else '-checkhost' }}"
+  register: _cert_check
+  changed_when: false
+  failed_when: false
+
+- name: Issue the server certificate
+  when: _cert_check.rc != 0
+  ansible.builtin.shell: |
+    set -eu
+    umask 077
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key.new
+    openssl req -new -key server.key.new -subj "/CN={{ fleet_server_address }}" -out server.csr
+    printf '%s\n' "subjectAltName={{ _san }}" "extendedKeyUsage=serverAuth" \
+      "keyUsage=critical,digitalSignature" "basicConstraints=critical,CA:FALSE" > server.ext
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 -sha256 \
+      -extfile server.ext -out server.crt.new
+    chgrp {{ fleet_tls_group }} server.key.new server.crt.new
+    chmod 0640 server.key.new
+    chmod 0644 server.crt.new
+    mv -f server.key.new server.key
+    mv -f server.crt.new server.crt
+    rm -f server.csr server.ext
+  args:
+    chdir: "{{ fleet_tls_dir }}"
+    executable: /bin/sh
+  changed_when: true
+  vars:
+    _san: >-
+      {{ (['IP:' ~ fleet_server_address] if _is_ip else ['DNS:' ~ fleet_server_address])
+         | union(['IP:127.0.0.1']) | union(fleet_server_extra_sans | default([])) | join(',') }}
+  notify:
+    - Restart rest-server
+    - Restart dashboard
+
+- name: Copy the CA certificate to the controller (clients pin it)
+  ansible.builtin.fetch:
+    src: "{{ fleet_tls_dir }}/ca.crt"
+    dest: "{{ fleet_credentials_dir }}/ca.crt"
+    flat: true

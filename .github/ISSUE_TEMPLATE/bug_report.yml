@@ -1,0 +1,29 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security problem?** Don't file it here, see [SECURITY.md](../blob/main/SECURITY.md).
+        Please remove passwords, tokens and public IP addresses from anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output
+      description: The failing Ansible task, `rfleet logs`, or `journalctl -u restic-fleet-…` output.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: restic-fleet commit or release, `ansible --version`, OS of the controller / server / machine
+    validations:
+      required: true

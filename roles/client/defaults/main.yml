@@ -1,0 +1,10 @@
+---
+# Per-host settings. Set these on each host in your inventory (see inventories/example).
+backup_paths: []            # directories/files to back up, e.g. ["/etc", "/srv/app"]
+backup_excludes: []         # extra restic exclude patterns
+backup_databases: []        # database dumps, see README ("Databases")
+backup_schedule: "{{ fleet_backup_schedule }}"
+backup_interval_hours: "{{ fleet_backup_interval_hours }}"
+backup_one_file_system: "{{ fleet_one_file_system }}"
+backup_pre_hook: ""         # shell run before the backup; a failure aborts it
+backup_post_hook: ""        # shell run after the backup

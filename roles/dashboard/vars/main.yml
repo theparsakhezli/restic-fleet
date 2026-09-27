@@ -1,0 +1,2 @@
+---
+_admin_password: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/dashboard-admin-password length=24 chars=ascii_letters,digits') }}"

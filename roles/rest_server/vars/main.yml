@@ -1,0 +1,2 @@
+---
+_rest_tarball: "rest-server_{{ fleet_rest_server_version }}_linux_{{ fleet_arch }}.tar.gz"

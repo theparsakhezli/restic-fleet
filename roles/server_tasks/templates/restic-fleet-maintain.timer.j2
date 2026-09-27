@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet: weekly repository maintenance
+
+[Timer]
+OnCalendar={{ fleet_maintenance_schedule }}
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

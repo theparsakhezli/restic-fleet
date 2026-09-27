@@ -1,0 +1,50 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic REST server (restic-fleet)
+Documentation=https://github.com/restic/rest-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=restic
+Group=restic
+# --append-only: clients can add backups but never delete or rewrite them, so a compromised
+#   client cannot destroy its history. Pruning runs locally on this server (restic-fleet-maintain).
+# --private-repos: each client can only reach the repository named after its own user.
+ExecStart=/usr/local/bin/rest-server \
+  --path {{ fleet_data_dir }} \
+  --listen {{ fleet_rest_listen }}:{{ fleet_rest_port }} \
+  --tls --tls-cert {{ fleet_tls_dir }}/server.crt --tls-key {{ fleet_tls_dir }}/server.key \
+  --htpasswd-file {{ fleet_etc }}/rest-server.htpasswd \
+  --append-only --private-repos{% if fleet_rest_max_size %} --max-size {{ fleet_rest_max_size }}{% endif %}
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths={{ fleet_data_dir }}
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target

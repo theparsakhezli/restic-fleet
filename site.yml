@@ -1,0 +1,47 @@
+---
+# Deploys the whole fleet: backup server first, then every client.
+#   ansible-playbook -i inventories/<name> site.yml
+#   ansible-playbook -i inventories/<name> site.yml --limit web1     (one client)
+#   ansible-playbook -i inventories/<name> site.yml -e fleet_run_backup_now=true
+
+- name: Prepare the controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create the credentials directory (secrets are generated here on first run)
+      ansible.builtin.file:
+        path: "{{ hostvars[groups[fleet_server_group | default('backup_server')][0]]['inventory_dir'] }}/credentials"
+        state: directory
+        mode: "0700"
+
+- name: Backup server
+  hosts: "{{ fleet_server_group | default('backup_server') }}"
+  become: true
+  roles:
+    - restic_binary
+    - rest_server
+    - dashboard
+    - server_tasks
+
+- name: Clients
+  hosts: "{{ fleet_client_group | default('backup_clients') }}"
+  become: true
+  roles:
+    - client
+
+- name: Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Where to go next
+      vars:
+        _server: "{{ groups[fleet_server_group | default('backup_server')][0] }}"
+        _creds: "{{ hostvars[_server]['inventory_dir'] }}/credentials"
+      ansible.builtin.debug:
+        msg:
+          - "Dashboard: {{ hostvars[_server].fleet_dashboard_url | default('https://' ~ hostvars[_server].ansible_host ~ ':8443') }}"
+          - "Login:     admin / password in {{ _creds }}/dashboard-admin-password"
+          - "Your browser will warn about the certificate: it is signed by the fleet's own CA ({{ _creds }}/ca.crt)."
+          - "BACK UP {{ _creds }} - it holds the repository passwords needed to restore."

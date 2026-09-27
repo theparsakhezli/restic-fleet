@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet: stale-lock cleanup, retention (forget --prune) and integrity check
+After=restic-fleet-rest-server.service
+
+[Service]
+Type=oneshot
+User=restic
+Group=restic
+ExecStart=/usr/local/sbin/restic-fleet-server maintain
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=24h
+{% include 'hardening.j2' %}

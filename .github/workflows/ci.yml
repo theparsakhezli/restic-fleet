@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -x setup.sh tests/e2e/run.sh roles/client/files/restic-fleet-backup roles/client/files/rfleet roles/rest_server/files/htpasswd-sync
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ansible-lint
+        run: |
+          pip install "ansible-core>=2.16,<2.20" ansible-lint
+          ansible-lint site.yml
+      - name: Unit tests
+        run: python -m unittest discover -s tests/unit -v
+
+  e2e:
+    needs: lint
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ansible: ["ansible-core>=2.16,<2.17", "ansible-core>=2.19,<2.20"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: End-to-end test
+        env:
+          ANSIBLE_CORE: ${{ matrix.ansible }}
+        run: tests/e2e/run.sh

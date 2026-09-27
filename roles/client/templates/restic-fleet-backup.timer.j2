@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet backup schedule
+
+[Timer]
+OnCalendar={{ backup_schedule }}
+RandomizedDelaySec={{ fleet_randomized_delay }}
+Persistent=true
+
+[Install]
+WantedBy=timers.target

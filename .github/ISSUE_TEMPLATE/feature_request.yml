@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an idea or a new backup type
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that restic-fleet makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How you'd like it to work. Config examples are welcome.

@@ -1,0 +1,3 @@
+---
+fleet_packages_debian: [bzip2, ca-certificates, curl, jq, util-linux, python3, openssl]
+fleet_packages_redhat: [bzip2, ca-certificates, curl, jq, util-linux, python3, openssl]

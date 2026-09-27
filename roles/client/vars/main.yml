@@ -1,0 +1,16 @@
+---
+_repo_password: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/repo-password/' ~ inventory_hostname ~ ' ' ~ fleet_secret_spec) }}"
+_rest_password: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/rest-password/' ~ inventory_hostname ~ ' ' ~ fleet_secret_spec) }}"
+_report_token: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/report-token/' ~ inventory_hostname ~ ' ' ~ fleet_secret_spec) }}"
+_restic_env:
+  RESTIC_REPOSITORY: "rest:https://{{ fleet_server_url_host }}:{{ fleet_rest_port }}/{{ inventory_hostname }}/"
+  RESTIC_REST_USERNAME: "{{ inventory_hostname }}"
+  RESTIC_REST_PASSWORD: "{{ _rest_password }}"
+  RESTIC_PASSWORD_FILE: "{{ fleet_etc }}/repo.pass"
+  RESTIC_CACERT: "{{ fleet_etc }}/ca.crt"
+  RESTIC_CACHE_DIR: "{{ fleet_cache_dir }}"
+_dump_ext:
+  postgres: .sql
+  mysql: .sql
+  mongodb: .archive
+  command: .dump

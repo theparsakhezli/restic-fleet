@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- App icon / favicon: the dial on an ink tile (reads at 16 px). -->
+  <rect width="64" height="64" rx="14" fill="#0F1B2A"/>
+  <g fill="none" stroke-width="8" transform="rotate(-90 32 32)">
+    <circle cx="32" cy="32" r="19" stroke="#4A5C7E" stroke-dasharray="15.9 4" stroke-dashoffset="-2"/>
+    <circle cx="32" cy="32" r="19" stroke="#8FA2FF" stroke-dasharray="15.9 103.48" stroke-dashoffset="-2"/>
+  </g>
+  <rect x="25" y="25" width="14" height="14" rx="4" fill="#E6EBF5"/>
+</svg>

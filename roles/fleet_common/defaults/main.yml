@@ -1,0 +1,95 @@
+---
+# Shared settings for every restic-fleet role. Override any of these in your inventory
+# (inventories/<name>/group_vars/all.yml) — never edit this file for a deployment.
+
+ansible_managed: "Managed by restic-fleet (Ansible). Local changes will be overwritten."
+
+# --- naming & topology -------------------------------------------------------------------
+fleet_name: restic-fleet
+fleet_server_group: backup_server       # inventory group holding exactly one backup server
+fleet_client_group: backup_clients      # inventory group holding the machines to back up
+fleet_server_host: "{{ groups[fleet_server_group][0] }}"
+# Address clients use to reach the server (IP or DNS name; it goes into the TLS certificate).
+fleet_server_address: >-
+  {{ hostvars[fleet_server_host].fleet_public_address
+     | default(hostvars[fleet_server_host].ansible_host | default(fleet_server_host)) }}
+fleet_server_url_host: "{{ '[' ~ fleet_server_address ~ ']' if ':' in fleet_server_address else fleet_server_address }}"
+
+# --- secrets -----------------------------------------------------------------------------
+# Generated on first run and kept on the machine running Ansible. BACK THIS DIRECTORY UP:
+# the repository passwords in it are the only way to restore if a client machine is lost.
+fleet_credentials_dir: "{{ hostvars[fleet_server_host]['inventory_dir'] }}/credentials"
+fleet_secret_spec: "length=48 chars=ascii_letters,digits"
+
+# --- backup server -------------------------------------------------------------------------
+fleet_data_dir: /srv/restic-fleet        # repositories live here, one directory per client
+fleet_rest_port: 8000
+fleet_rest_listen: ""                    # "" = all interfaces
+fleet_rest_max_size: ""                  # optional total size cap in bytes for rest-server
+fleet_dashboard_port: 8443
+fleet_dashboard_listen: "0.0.0.0"
+fleet_dashboard_admin: admin
+fleet_dashboard_url: "https://{{ fleet_server_url_host }}:{{ fleet_dashboard_port }}"  # for people/alerts; machines report to the server directly
+fleet_metrics_enabled: false             # expose /metrics (Prometheus) with a bearer token
+fleet_dashboard_trusted_proxy: false     # true behind your own reverse proxy (trust X-Forwarded-For)
+
+# Server-side maintenance (forget/prune/check) needs each repository's password on the server.
+# Set to false to keep repository passwords off the server entirely (see README: trust model).
+fleet_server_maintenance: true
+fleet_maintenance_schedule: "Sun *-*-* 04:00:00"
+fleet_collect_schedule: "*:0/10"
+fleet_check_subset: "5%"
+fleet_retention:                         # restic --keep-* flags; per-host override: backup_retention
+  last: 0
+  hourly: 0
+  daily: 7
+  weekly: 4
+  monthly: 6
+  yearly: 1
+
+# Firewall: when ufw is installed and active, only allow clients to reach rest-server and
+# only these CIDRs to reach the dashboard. Nothing is enabled if ufw is inactive.
+fleet_manage_ufw: true
+fleet_dashboard_allow_from: ["any"]
+
+# --- clients -------------------------------------------------------------------------------
+fleet_backup_schedule: "*-*-* 02:30:00"  # systemd OnCalendar; per-host override: backup_schedule
+fleet_backup_interval_hours: 24          # how often a backup is expected (overdue alerts)
+fleet_randomized_delay: 30min            # spread clients so they don't all start at once
+fleet_compression: auto                  # restic --compression: auto | max | off
+fleet_pack_size_mib: 32                  # bigger packs = fewer files on the server
+fleet_one_file_system: false
+fleet_default_excludes:
+  - "/proc"
+  - "/sys"
+  - "/dev"
+  - "/run"
+  - "/tmp"
+  - "/var/tmp"
+  - "/var/cache/restic-fleet"
+  - "**/node_modules"
+  - "**/.cache"
+  - "**/__pycache__"
+fleet_run_backup_now: false              # start a backup right after deploying (first install)
+
+# --- notifications (sent by the dashboard) -----------------------------------------------
+fleet_notify_telegram_token: ""
+fleet_notify_telegram_chat_ids: []
+fleet_notify_webhook_url: ""             # receives {"text": ..., "fleet": ...} as JSON
+
+# --- pinned binaries (verified by SHA-256 before install) --------------------------------
+fleet_restic_version: "0.19.1"
+fleet_restic_sha256:
+  amd64: f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+  arm64: a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465
+fleet_rest_server_version: "0.14.0"
+fleet_rest_server_sha256:
+  amd64: 4c9c95bc079a0334e81fad379b19dc5c3353c71c2c88d652cafce2081c2b1c66
+  arm64: cef139cbe8b27b16bda731d17f093b0aa466b8c60b136c12d78b6f2bff3daf22
+fleet_arch: "{{ {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}[ansible_facts.architecture] }}"
+
+# --- fixed paths ---------------------------------------------------------------------------
+fleet_etc: /etc/restic-fleet
+fleet_tls_dir: /etc/restic-fleet/tls
+fleet_tls_group: restic-fleet-tls
+fleet_cache_dir: /var/cache/restic-fleet

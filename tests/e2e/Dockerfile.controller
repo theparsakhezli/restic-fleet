@@ -1,0 +1,7 @@
+# The machine that runs Ansible in the end-to-end test.
+FROM python:3.12-slim
+ARG ANSIBLE_CORE=ansible-core>=2.16,<2.20
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client curl jq \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir "${ANSIBLE_CORE}"
+WORKDIR /work

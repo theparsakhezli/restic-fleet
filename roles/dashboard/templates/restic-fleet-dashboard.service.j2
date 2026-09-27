@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+[Unit]
+Description=restic-fleet dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=rfdash
+Group=rfdash
+Environment=RFD_CONFIG={{ fleet_etc }}/dashboard.json
+Environment=RFD_STATE_DIR=/var/lib/restic-fleet-dashboard
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/restic-fleet/restic_fleet_dashboard.py serve
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/restic-fleet-dashboard
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

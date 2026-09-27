@@ -1,0 +1,15 @@
+# Fleet-wide settings. Every option with its default is documented in
+# roles/fleet_common/defaults/main.yml — copy what you want to change here.
+fleet_name: example-fleet
+
+# fleet_backup_schedule: "*-*-* 02:30:00"
+# fleet_retention: { daily: 7, weekly: 4, monthly: 6, yearly: 1 }
+# fleet_data_dir: /srv/restic-fleet
+
+# Notifications (sent by the dashboard on failures, overdue backups and recovery):
+# fleet_notify_telegram_token: "123456:ABC..."        # better: put secrets in an ansible-vault file
+# fleet_notify_telegram_chat_ids: ["123456789"]
+# fleet_notify_webhook_url: "https://hooks.slack.com/services/..."
+
+# Restrict who can open the dashboard (clients must still be able to reach it to report):
+# fleet_dashboard_allow_from: ["203.0.113.0/24"]

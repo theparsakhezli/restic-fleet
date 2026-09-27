@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <style>
+    .ring { stroke: #9AA8C2; } .lit { stroke: #3350D8; } .core { fill: #0F1B2A; } .slot { fill: #F4F6FA; }
+    @media (prefers-color-scheme: dark) {
+      .ring { stroke: #4A5C7E; } .lit { stroke: #8FA2FF; } .core { fill: #E6EBF5; } .slot { fill: #0B1220; }
+    }
+  </style>
+  <g fill="none" stroke-width="7" transform="rotate(-90 32 32)">
+    <circle class="ring" cx="32" cy="32" r="22" stroke-dasharray="19.04 4" stroke-dashoffset="-2"/>
+    <circle class="lit" cx="32" cy="32" r="22" stroke-dasharray="19.04 119.19" stroke-dashoffset="-2"/>
+  </g>
+  <rect class="core" x="23" y="23" width="18" height="18" rx="5"/>
+  <rect class="slot" x="29" y="30" width="6" height="4" rx="1.5"/>
+</svg>

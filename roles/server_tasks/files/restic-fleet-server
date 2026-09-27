@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""restic-fleet server tasks (run as the `restic` user on the backup server).
+
+    restic-fleet-server collect    repository size / snapshot stats -> dashboard (every few minutes)
+    restic-fleet-server maintain   stale-lock cleanup, forget --prune, check  -> dashboard (weekly)
+
+Config: /etc/restic-fleet/server.json (written by Ansible). Repository passwords are read from
+<repo_pass_dir>/<client>.pass; without one, only the on-disk size is collected and maintenance
+is skipped for that client (see "Maintenance and the trust model" in the README).
+"""
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+CONFIG = os.environ.get("RFS_CONFIG", "/etc/restic-fleet/server.json")
+
+
+def load() -> dict:
+    with open(CONFIG, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def restic_env(cfg: dict, client: str) -> dict | None:
+    pass_file = os.path.join(cfg["repo_pass_dir"], f"{client}.pass")
+    if not os.path.isfile(pass_file):
+        return None
+    return {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": cfg["cache_dir"],
+            "RESTIC_REPOSITORY": os.path.join(cfg["data_dir"], client),
+            "RESTIC_PASSWORD_FILE": pass_file, "RESTIC_CACHE_DIR": cfg["cache_dir"]}
+
+
+def restic(env: dict, *args: str, timeout: int = 3600) -> subprocess.CompletedProcess:
+    return subprocess.run(["restic", *args], env=env, capture_output=True, text=True, timeout=timeout)
+
+
+def dir_size(path: str) -> int:
+    """Allocated bytes (like du), without following symlinks."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def parse_time(value: str) -> float:
+    # restic prints RFC3339 with nanoseconds, e.g. 2026-09-27T03:00:12.123456789+02:00
+    head, _, rest = value.partition(".")
+    tz = ""
+    for sep in ("+", "-", "Z"):
+        if sep in rest:
+            idx = rest.index(sep)
+            tz = rest[idx:]
+            break
+    tz = "+00:00" if tz in ("", "Z") else tz
+    return datetime.fromisoformat(head + tz).timestamp()
+
+
+def post(cfg: dict, payload: dict) -> None:
+    ctx = ssl.create_default_context(cafile=cfg["dashboard_cacert"]) if cfg["dashboard_url"].startswith("https") else None
+    with open(cfg["token_file"], encoding="utf-8") as fh:
+        token = fh.read().strip()
+    req = urllib.request.Request(
+        cfg["dashboard_url"].rstrip("/") + "/api/v1/server-report", data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    for attempt in range(3):
+        try:
+            urllib.request.urlopen(req, timeout=20, context=ctx).read()
+            return
+        except OSError as exc:
+            if attempt == 2:
+                print(f"dashboard report failed: {exc}", file=sys.stderr)
+            time.sleep(3)
+
+
+def collect(cfg: dict) -> int:
+    repos = {}
+    for client in cfg["clients"]:
+        path = os.path.join(cfg["data_dir"], client)
+        if not os.path.isdir(path):
+            continue
+        info: dict = {"size_bytes": dir_size(path)}
+        env = restic_env(cfg, client)
+        if env:
+            # snapshots only reads the small snapshot files; --no-lock never blocks backups
+            r = restic(env, "snapshots", "--json", "--no-lock", timeout=300)
+            if r.returncode == 0:
+                snaps = json.loads(r.stdout or "[]")
+                info["snapshots"] = len(snaps)
+                if snaps:
+                    info["last_snapshot"] = max(parse_time(s["time"]) for s in snaps)
+        repos[client] = info
+    post(cfg, {"repos": repos})
+    return 0
+
+
+def maintain(cfg: dict) -> int:
+    results, failed = {}, 0
+    for client, retention in cfg["clients"].items():
+        env = restic_env(cfg, client)
+        if env is None or not os.path.isdir(os.path.join(cfg["data_dir"], client)):
+            continue
+        # 1. locks left by crashed/killed processes (restic only removes stale ones)
+        restic(env, "unlock", timeout=600)
+        # retention keys map straight onto restic flags: {"daily": 7} -> --keep-daily 7
+        args = ["forget", "--prune", "--retry-lock", cfg.get("retry_lock", "1h"), "--group-by", "host,paths,tags"]
+        for key, value in retention.items():
+            if value:
+                args += [f"--keep-{key}", str(value)]
+        # 2. retention + prune, 3. verify structure and a slice of the actual data
+        steps = [args, ["check", "--retry-lock", cfg.get("retry_lock", "1h"),
+                        f"--read-data-subset={cfg.get('check_subset', '5%')}"]]
+        message, ok = [], True
+        for step in steps:
+            r = restic(env, *step, timeout=cfg.get("step_timeout", 6 * 3600))
+            if r.returncode != 0:
+                ok = False
+                message.append(f"restic {step[0]} failed: {(r.stderr or r.stdout).strip()[-800:]}")
+                break
+        if ok:
+            message.append(f"forget/prune and check ({cfg.get('check_subset', '5%')} of data) passed")
+        else:
+            failed += 1
+        results[client] = {"ok": ok, "message": "\n".join(message)}
+        print(f"{client}: {'ok' if ok else 'FAILED'}", flush=True)
+    post(cfg, {"maintenance": results})
+    collect(cfg)
+    return 1 if failed else 0
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in ("collect", "maintain"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    cfg = load()
+    return collect(cfg) if sys.argv[1] == "collect" else maintain(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

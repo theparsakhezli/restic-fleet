@@ -1,0 +1,29 @@
+#!/bin/sh
+# {{ ansible_managed }}
+# Database job "{{ db.name }}": writes the dump to stdout, which restic streams into the
+# repository (no temporary file). A non-zero exit fails the snapshot.
+set -eu
+{% set all = db.database | default('all') == 'all' %}
+{% set docker = 'docker exec ' ~ db.container ~ ' ' if db.container is defined else '' %}
+{% if db.type == 'postgres' %}
+{%   set tool = 'pg_dumpall' if all else 'pg_dump' %}
+{%   if db.container is defined %}
+exec {{ docker }}{{ tool }} -U {{ db.user | default('postgres') }} {{ db.options | default('') }} {{ '' if all else db.database }}
+{%   else %}
+exec runuser -u {{ db.user | default('postgres') }} -- {{ tool }} {{ db.options | default('') }} {{ '' if all else db.database }}
+{%   endif %}
+{% elif db.type == 'mysql' %}
+{%   set opts = '--single-transaction --quick --routines --events --triggers --hex-blob ' ~ db.options | default('') %}
+{%   set which = '--all-databases' if all else '--databases ' ~ db.database %}
+{%   if db.container is defined %}
+# The root password comes from the container's own environment, so it never appears here.
+exec {{ docker }}sh -c 'd=$(command -v mariadb-dump || command -v mysqldump); MYSQL_PWD="${MYSQL_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" exec "$d" -u{{ db.user | default("root") }} {{ opts }} {{ which }}'
+{%   else %}
+d=$(command -v mariadb-dump || command -v mysqldump)
+exec "$d" --defaults-extra-file={{ db.defaults_file | default('/etc/mysql/debian.cnf') | quote }} {{ opts }} {{ which }}
+{%   endif %}
+{% elif db.type == 'mongodb' %}
+exec {{ docker }}mongodump --archive --quiet {{ db.options | default('') }}{{ '' if all else ' --db=' ~ db.database }}
+{% else %}
+exec sh -c {{ db.command | quote }}
+{% endif %}

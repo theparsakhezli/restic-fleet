@@ -1,0 +1,10 @@
+---
+profile: production
+skip_list:
+  # restic-fleet's roles form one product configured through a single shared `fleet_*`
+  # namespace (roles/fleet_common/defaults/main.yml); per-role prefixes would split it.
+  - var-naming[no-role-prefix]
+exclude_paths:
+  - .venv/
+  - tests/e2e/inventory/credentials/
+  - .github/
