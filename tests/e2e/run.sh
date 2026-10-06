@@ -16,17 +16,23 @@ node() { local n=$1; shift; docker exec "rf-e2e-$n" bash -c "$*"; }
 ctl()  { docker exec -w /work rf-e2e-controller bash -c "$*"; }
 jq_()  { docker exec -i rf-e2e-controller jq "$@"; }   # jq reading stdin
 
+# The controller runs as root, so files it writes into the bind-mounted repo (SSH key,
+# inventory/credentials with mode 0700/0600) are root-owned on a Linux host: read and
+# delete them through the controller, not from the host.
+cred() { ctl "cat tests/e2e/inventory/credentials/$1"; }
+wipe() { ctl "rm -rf tests/e2e/.ssh tests/e2e/inventory/credentials" 2>/dev/null || rm -rf .ssh inventory/credentials; }
+
 cleanup() {
   if [ "${KEEP:-0}" != 1 ]; then
+    wipe
     docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-    rm -rf .ssh inventory/credentials
   fi
 }
 trap cleanup EXIT
 
 step "Start the test fleet"
-rm -rf .ssh inventory/credentials
 docker compose up -d --build --quiet-pull >/dev/null
+wipe
 for n in server web1 db1; do
   for _ in $(seq 60); do
     state=$(docker exec "rf-e2e-$n" systemctl is-system-running 2>/dev/null || true)
@@ -92,7 +98,7 @@ node web1 "set -a; . /etc/restic-fleet/fleet.env; set +a; \
 node web1 "stat -c '%a %U' /etc/restic-fleet/fleet.env /etc/restic-fleet/repo.pass" | grep -qv '^600 root' \
   && die "client secrets not 0600 root" || ok "client secrets are 0600 root"
 node server "grep -qF ':\$2y\$' /etc/restic-fleet/rest-server.htpasswd" && ok "rest-server passwords are bcrypt" || die "htpasswd"
-token=$(cat inventory/credentials/report-token/web1)
+token=$(cred report-token/web1)
 node server "grep -qF '$token' /etc/restic-fleet/dashboard.json" && die "plain report token stored on the server" \
   || ok "dashboard stores only token hashes, never the tokens"
 code=$(ctl "curl -s -o /dev/null -w '%{http_code}' --cacert tests/e2e/inventory/credentials/ca.crt -X POST \
@@ -106,7 +112,7 @@ node server "systemctl start restic-fleet-maintain.service" \
   && ok "forget/prune/check passed on the server" || { node server "journalctl -u restic-fleet-maintain --no-pager -n 30"; die maintenance; }
 
 step "Dashboard"
-pw=$(cat inventory/credentials/dashboard-admin-password)
+pw=$(cred dashboard-admin-password)
 state=$(ctl "c=\$(mktemp); curl -s --cacert tests/e2e/inventory/credentials/ca.crt -c \$c -o /dev/null \
   -H 'Origin: https://server:8443' --data-urlencode username=admin --data-urlencode password='$pw' https://server:8443/login; \
   curl -s --cacert tests/e2e/inventory/credentials/ca.crt -b \$c https://server:8443/api/v1/state")
