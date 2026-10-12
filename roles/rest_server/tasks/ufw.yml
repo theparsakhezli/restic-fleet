@@ -32,6 +32,17 @@
     - "'any' not in fleet_dashboard_allow_from"
     - (hostvars[item].fleet_source_address | default(hostvars[item].ansible_host | default(''))) is match('^[0-9a-fA-F:.]+(/[0-9]+)?$')
 
+# Earlier versions defaulted to "any"; drop that rule once the dashboard is restricted.
+- name: Remove the old allow-anyone dashboard rule
+  ansible.builtin.command:
+    cmd: ufw delete allow from any to any port {{ fleet_dashboard_port }} proto tcp
+  register: _ufw_any
+  changed_when: "'Rule deleted' in _ufw_any.stdout"
+  failed_when: _ufw_any.rc != 0 and 'non-existent' not in (_ufw_any.stdout ~ _ufw_any.stderr)
+  when:
+    - "'Status: active' in _ufw.stdout"
+    - "'any' not in fleet_dashboard_allow_from"
+
 - name: Allow people to open the dashboard
   ansible.builtin.command:
     cmd: >-

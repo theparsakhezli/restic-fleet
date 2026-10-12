@@ -21,10 +21,11 @@
       - db.database is not defined or db.database is match('^[A-Za-z0-9_$.-]+$')
       - db.user is not defined or db.user is match('^[A-Za-z0-9_.-]+$')
       - db.container is not defined or db.container is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+      - db.filename is not defined or db.filename is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
     fail_msg: >-
       {{ inventory_hostname }}: database job {{ db.name | default('?') }} is invalid. Needs name,
-      type (postgres|mysql|mongodb|command); database/user/container may only contain letters,
-      digits and . _ - (command jobs need `command`).
+      type (postgres|mysql|mongodb|command); database/user/container/filename may only contain
+      letters, digits and . _ - (command jobs need `command`).
     quiet: true
   loop: "{{ backup_databases }}"
   loop_control:
@@ -163,10 +164,20 @@
   failed_when: false
   no_log: true
 
+# restic exits 10 only when the repository does not exist. Anything else (wrong password = 12,
+# TLS or network errors = 1) must stop the deploy rather than lead to an init attempt.
+- name: Stop if the repository can't be opened
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }}: cannot open its repository (restic exit {{ _repo.rc }}; 12 = wrong
+      repository password, 1 = connection/TLS problem). Not initialising anything.
+      {{ (_repo.stderr | default(''))[-300:] }}
+  when: _repo.rc not in [0, 10]
+
 - name: Initialise the repository
   ansible.builtin.command: /usr/local/bin/restic init
   environment: "{{ _restic_env }}"
-  when: _repo.rc != 0
+  when: _repo.rc == 10
   register: _init
   changed_when: true
   failed_when: _init.rc != 0

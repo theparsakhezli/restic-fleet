@@ -22,6 +22,21 @@
     group: restic
     mode: "0750"
 
+# Repositories created before group access was enabled are owner-only (0700/0600); give the
+# `restic` group (rest-server and the maintenance user) the access rest-server now grants itself.
+- name: Share existing repositories with the restic group
+  ansible.builtin.shell: |
+    set -eu
+    d={{ fleet_data_dir | quote }}
+    [ -n "$(find "$d" -mindepth 1 \( -type d ! -perm -0070 -o -type f ! -perm -0040 \) -print -quit)" ] || exit 0
+    find "$d" -mindepth 1 -type d ! -perm -0070 -exec chmod g+rwx {} +
+    find "$d" -mindepth 1 -type f ! -perm -0040 -exec chmod g+r {} +
+    echo CHANGED
+  args:
+    executable: /bin/sh
+  register: _repo_perms
+  changed_when: "'CHANGED' in _repo_perms.stdout"
+
 - name: Read the installed rest-server version
   ansible.builtin.command: /usr/local/bin/rest-server --version
   register: _rest_version

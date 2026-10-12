@@ -12,14 +12,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.request
 from datetime import datetime
 
 CONFIG = os.environ.get("RFS_CONFIG", "/etc/restic-fleet/server.json")
+
+KEEP_COUNTS = {"last", "hourly", "daily", "weekly", "monthly", "yearly"}
+KEEP_WITHIN = {"within", "within-hourly", "within-daily", "within-weekly", "within-monthly", "within-yearly"}
+DURATION_RE = re.compile(r"^([0-9]+[ymdh])+$")
+# A snapshot's time is when its backup *started* (client clock); the server stores the snapshot file
+# when it *finished*. Allow client clock skew one way and the longest backup run the other.
+SNAPSHOT_FUTURE_TOLERANCE = 3600
+SNAPSHOT_PAST_TOLERANCE = 13 * 3600       # the client unit's TimeoutStartSec is 12h
 
 
 def load() -> dict:
@@ -40,6 +51,23 @@ def restic(env: dict, *args: str, timeout: int = 3600) -> subprocess.CompletedPr
     return subprocess.run(["restic", *args], env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def restic_stream(env: dict, *args: str, timeout: int = 3600) -> tuple[int, int, str]:
+    """Run restic, count (and discard) what it writes to stdout. Returns (exit code, bytes, stderr)."""
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(["restic", *args], env=env, stdout=subprocess.PIPE, stderr=err)
+        timer = threading.Timer(timeout, proc.kill)
+        timer.start()
+        total = 0
+        try:
+            while chunk := proc.stdout.read(1 << 20):
+                total += len(chunk)
+            rc = proc.wait()
+        finally:
+            timer.cancel()
+        err.seek(0)
+        return rc, total, err.read().decode(errors="replace")
+
+
 def dir_size(path: str) -> int:
     """Allocated bytes (like du), without following symlinks."""
     total = 0
@@ -52,17 +80,17 @@ def dir_size(path: str) -> int:
     return total
 
 
+TIME_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
+
+
 def parse_time(value: str) -> float:
-    # restic prints RFC3339 with nanoseconds, e.g. 2026-09-27T03:00:12.123456789+02:00
-    head, _, rest = value.partition(".")
-    tz = ""
-    for sep in ("+", "-", "Z"):
-        if sep in rest:
-            idx = rest.index(sep)
-            tz = rest[idx:]
-            break
-    tz = "+00:00" if tz in ("", "Z") else tz
-    return datetime.fromisoformat(head + tz).timestamp()
+    # restic prints RFC3339 with up to nanoseconds, e.g. 2026-09-27T03:00:12.123456789+02:00; the
+    # fraction is left out entirely when it is zero (2026-09-27T03:00:12Z).
+    m = TIME_RE.match(value)
+    if not m:
+        raise ValueError(f"unexpected snapshot time {value!r}")
+    base, frac, tz = m.groups()
+    return datetime.fromisoformat(base + ("+00:00" if tz == "Z" else tz)).timestamp() + float("0." + (frac or "0"))
 
 
 def post(cfg: dict, payload: dict) -> None:
@@ -74,7 +102,8 @@ def post(cfg: dict, payload: dict) -> None:
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     for attempt in range(3):
         try:
-            urllib.request.urlopen(req, timeout=20, context=ctx).read()
+            # URL written by Ansible: https://127.0.0.1:<port>, verified against the fleet CA
+            urllib.request.urlopen(req, timeout=20, context=ctx).read()  # nosec B310
             return
         except OSError as exc:
             if attempt == 2:
@@ -94,41 +123,165 @@ def collect(cfg: dict) -> int:
             # snapshots only reads the small snapshot files; --no-lock never blocks backups
             r = restic(env, "snapshots", "--json", "--no-lock", timeout=300)
             if r.returncode == 0:
-                snaps = json.loads(r.stdout or "[]")
-                info["snapshots"] = len(snaps)
-                if snaps:
-                    info["last_snapshot"] = max(parse_time(s["time"]) for s in snaps)
+                try:
+                    snaps = json.loads(r.stdout or "[]")
+                    info["snapshots"] = len(snaps)
+                    if snaps:
+                        # ignore future-dated snapshots: they would mask a host that stopped backing up
+                        times = [t for t in (parse_time(s["time"]) for s in snaps) if t <= time.time() + 3600]
+                        if times:
+                            info["last_snapshot"] = max(times)
+                except (ValueError, KeyError) as exc:   # one odd repository must not stop the others
+                    print(f"{client}: could not read snapshots: {exc}", file=sys.stderr)
         repos[client] = info
     post(cfg, {"repos": repos})
     return 0
 
 
+def keep_args(retention) -> list[str]:
+    """restic --keep-* flags for a retention dict ({"daily": 7} -> --keep-daily 7). Raises ValueError
+    on anything restic-fleet doesn't understand, so a typo can't silently change what is kept."""
+    if not isinstance(retention, dict):
+        raise ValueError("retention must be a mapping")
+    args = []
+    for key, value in retention.items():
+        if key in KEEP_COUNTS:
+            if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value):
+                value = int(value)
+            if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+                raise ValueError(f"keep-{key} must be a whole number (-1 = keep all), got {value!r}")
+            if value:
+                args += [f"--keep-{key}", str(value)]
+        elif key in KEEP_WITHIN:
+            if value in (None, "", 0):
+                continue
+            if not isinstance(value, str) or not DURATION_RE.match(value):
+                raise ValueError(f"keep-{key} must be a duration like 30d or 1y6m, got {value!r}")
+            args += [f"--keep-{key}", value]
+        else:
+            raise ValueError(f"unknown retention key {key!r}")
+    return args
+
+
+def forged_snapshots(cfg: dict, client: str, env: dict) -> list[str]:
+    """Snapshots whose claimed time doesn't match when the server received them.
+
+    Retention trusts snapshot times, and those come from the client. A compromised client can't
+    delete anything through the append-only server, but it could upload back-dated or future-dated
+    snapshots so that the next forget keeps those and drops the real history. The server-side file
+    time of snapshots/<id> can't be set by the client, so compare the two before forgetting anything.
+    """
+    r = restic(env, "snapshots", "--json", "--no-lock", timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"restic snapshots failed: {(r.stderr or r.stdout).strip()[-400:]}")
+    snap_dir = os.path.join(cfg["data_dir"], client, "snapshots")
+    future = cfg.get("snapshot_future_tolerance", SNAPSHOT_FUTURE_TOLERANCE)
+    past = cfg.get("snapshot_past_tolerance", SNAPSHOT_PAST_TOLERANCE)
+    bad = []
+    for snap in json.loads(r.stdout or "[]"):
+        try:
+            stored = os.stat(os.path.join(snap_dir, snap["id"])).st_mtime
+        except OSError:
+            continue        # listed by restic but not a plain file here (other backend layout)
+        claimed = parse_time(snap["time"])
+        if claimed > stored + future or claimed < stored - past:
+            bad.append(f"{snap['id'][:8]} claims {snap['time'][:19]} but arrived "
+                       f"{datetime.fromtimestamp(stored).isoformat(timespec='seconds')}")
+    return bad
+
+
+def restore_test(cfg: dict, env: dict) -> tuple[bool, str]:
+    """Restore the newest snapshot of every job (files, each database) to nowhere.
+
+    `restic dump --archive tar` reads, decrypts and verifies every blob of every file and rebuilds
+    the whole tree, which is a real restore minus the disk space. `check --read-data-subset` only
+    proves that a sample of packs is intact; this proves the latest backups come back whole.
+    """
+    r = restic(env, "snapshots", "--json", "--no-lock", "--latest", "1", "--group-by", "host,paths,tags",
+               timeout=600)
+    if r.returncode != 0:
+        return False, f"restore test: restic snapshots failed: {(r.stderr or r.stdout).strip()[-400:]}"
+    groups = json.loads(r.stdout or "[]")
+    snaps = [s for g in groups for s in (g.get("snapshots", []) if "snapshots" in g else [g])]
+    if not snaps:
+        return True, "restore test: no snapshots yet"
+    total = 0
+    for snap in snaps:
+        rc, size, err = restic_stream(env, "dump", "--retry-lock", cfg.get("retry_lock", "1h"),
+                                      "--archive", "tar", snap["id"], "/",
+                                      timeout=cfg.get("step_timeout", 6 * 3600))
+        expected = (snap.get("summary") or {}).get("total_bytes_processed") or 0
+        if rc != 0:
+            return False, f"restore test of snapshot {snap['id'][:8]} failed (restic exit {rc}): {err.strip()[-600:]}"
+        if expected and size == 0:
+            return False, f"restore test of snapshot {snap['id'][:8]} produced no data"
+        total += size
+    return True, f"restore test passed ({len(snaps)} latest snapshot(s), {total / 2**20:.1f} MiB restored)"
+
+
+def restore_test_due(cfg: dict, client: str) -> str | None:
+    """Path of the client's restore-test stamp if a test is due, else None (0 days = never)."""
+    days = int(cfg.get("restore_test_days", 28) or 0)
+    if days <= 0:
+        return None
+    stamp = os.path.join(cfg["cache_dir"], f"restore-test-{client}.last")
+    try:
+        if time.time() - os.stat(stamp).st_mtime < days * 86400 - 3600:
+            return None
+    except OSError:
+        pass
+    return stamp
+
+
 def maintain(cfg: dict) -> int:
     results, failed = {}, 0
+    verify_times = str(cfg.get("verify_snapshot_times", True)).lower() not in ("false", "0", "no")
     for client, retention in cfg["clients"].items():
         env = restic_env(cfg, client)
         if env is None or not os.path.isdir(os.path.join(cfg["data_dir"], client)):
             continue
+        message, ok = [], True
         # 1. locks left by crashed/killed processes (restic only removes stale ones)
         restic(env, "unlock", timeout=600)
-        # retention keys map straight onto restic flags: {"daily": 7} -> --keep-daily 7
-        args = ["forget", "--prune", "--retry-lock", cfg.get("retry_lock", "1h"), "--group-by", "host,paths,tags"]
-        for key, value in retention.items():
-            if value:
-                args += [f"--keep-{key}", str(value)]
-        # 2. retention + prune, 3. verify structure and a slice of the actual data
-        steps = [args, ["check", "--retry-lock", cfg.get("retry_lock", "1h"),
-                        f"--read-data-subset={cfg.get('check_subset', '5%')}"]]
-        message, ok = [], True
+        steps = []
+        try:
+            forget = ["forget", "--prune", "--retry-lock", cfg.get("retry_lock", "1h"),
+                      "--group-by", "host,paths,tags", *keep_args(retention)]
+            suspicious = forged_snapshots(cfg, client, env) if verify_times else []
+        except (ValueError, RuntimeError, KeyError) as exc:
+            ok, suspicious = False, []
+            message.append(f"retention skipped: {exc}")
+        if suspicious:
+            ok = False
+            message.append(f"retention skipped: {len(suspicious)} snapshot(s) have a time that doesn't match "
+                           "when they were uploaded (clock problem, or a compromised machine trying to push "
+                           "real backups out of the retention window). Nothing was forgotten. "
+                           + "; ".join(suspicious[:5]))
+        elif ok:
+            steps.append(forget)       # 2. retention + prune
+        # 3. verify structure and a slice of the actual data (always, even when retention was skipped)
+        steps.append(["check", "--retry-lock", cfg.get("retry_lock", "1h"),
+                      f"--read-data-subset={cfg.get('check_subset', '5%')}"])
+        subset = cfg.get("check_subset", "5%")
         for step in steps:
             r = restic(env, *step, timeout=cfg.get("step_timeout", 6 * 3600))
             if r.returncode != 0:
                 ok = False
                 message.append(f"restic {step[0]} failed: {(r.stderr or r.stdout).strip()[-800:]}")
                 break
-        if ok:
-            message.append(f"forget/prune and check ({cfg.get('check_subset', '5%')} of data) passed")
         else:
+            message.append(f"forget/prune and check ({subset} of data) passed" if ok else f"check ({subset} of data) passed")
+            # 4. every few weeks: restore the latest snapshots completely (only if the check passed)
+            stamp = restore_test_due(cfg, client)
+            if stamp:
+                passed, note = restore_test(cfg, env)
+                message.append(note)
+                if passed:
+                    with open(stamp, "w", encoding="utf-8") as fh:
+                        fh.write(f"{time.time():.0f}\n")
+                else:
+                    ok = False
+        if not ok:
             failed += 1
         results[client] = {"ok": ok, "message": "\n".join(message)}
         print(f"{client}: {'ok' if ok else 'FAILED'}", flush=True)

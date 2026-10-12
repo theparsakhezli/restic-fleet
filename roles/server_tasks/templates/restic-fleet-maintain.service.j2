@@ -5,8 +5,9 @@ After=restic-fleet-rest-server.service
 
 [Service]
 Type=oneshot
-User=restic
+User=restic-maint
 Group=restic
+SupplementaryGroups=restic-maint
 ExecStart=/usr/local/sbin/restic-fleet-server maintain
 Nice=10
 IOSchedulingClass=idle

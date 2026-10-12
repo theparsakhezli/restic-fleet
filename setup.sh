@@ -212,7 +212,7 @@ ask_client() {
 
 # ------------------------------------------------------------------ commands
 cmd_new() {
-  local fleet ssh_user key server server_addr data_dir tg_token tg_chats webhook tmp
+  local fleet ssh_user key server server_addr data_dir maint dash_allow tg_token tg_chats webhook tmp
   title "restic-fleet: new backup fleet"
   say "You'll need: SSH access (with sudo) to one backup server and to every machine to back up."
   say "Nothing is changed on any machine until you confirm at the end."
@@ -227,6 +227,13 @@ cmd_new() {
   ask server "Name" "backup" "$NAME_RE" "Letters, digits, . _ - only."
   ask server_addr "IP address or DNS name clients will use" "" '^[A-Za-z0-9.:-]+$' "An IP address or host name."
   ask data_dir "Where to store the repositories" "/srv/restic-fleet" '^/[^[:space:]]*$' "An absolute path."
+  say "${D}Deleting old backups (retention) and integrity checks need each repository's password.${N}"
+  choose maint "Who should prune and check the backups?" \
+    "The backup server, weekly (automatic; the server can then decrypt backups)" \
+    "Nobody automatically (the server never sees a repository password; you prune by hand)"
+  say "${D}Machines always report to the dashboard with their own token; this is about people.${N}"
+  ask dash_allow "Who may open the dashboard: 'private' (LAN/VPN addresses), 'any', or CIDRs (comma-separated)" \
+    "private" '^(private|any|[0-9a-fA-F:./]+(,[ ]*[0-9a-fA-F:./]+)*)$' "private, any, or CIDRs like 203.0.113.0/24"
 
   tmp=$(mktemp)
   trap 'rm -f "$tmp"' RETURN
@@ -253,6 +260,17 @@ cmd_new() {
     printf '# Fleet-wide settings; every option is documented in roles/fleet_common/defaults/main.yml\n'
     printf 'fleet_name: %s\n' "$(q "$fleet")"
     printf 'fleet_data_dir: %s\n' "$(q "$data_dir")"
+    case $maint in
+      The*) printf 'fleet_server_maintenance: true    # the server holds repository passwords (docs/security.md)\n' ;;
+      *)    printf 'fleet_server_maintenance: false   # prune and check by hand (docs/security.md)\n' ;;
+    esac
+    case $dash_allow in
+      private) ;;                     # the default: private, VPN and loopback ranges
+      any) printf 'fleet_dashboard_allow_from: ["any"]\n' ;;
+      *) printf 'fleet_dashboard_allow_from:\n'
+         IFS=',' read -ra arr <<<"$dash_allow"
+         for c in "${arr[@]}"; do printf '  - %s\n' "$(q "$(echo "$c" | xargs)")"; done ;;
+    esac
     [ -n "$webhook" ] && printf 'fleet_notify_webhook_url: %s\n' "$(q "$webhook")"
     if [ -n "$tg_chats" ]; then
       printf 'fleet_notify_telegram_chat_ids:\n'

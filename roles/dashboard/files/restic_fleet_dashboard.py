@@ -23,6 +23,7 @@ import gzip
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
@@ -46,6 +47,8 @@ MAX_BODY = 64 * 1024
 SESSION_SECONDS = 12 * 3600
 LOGIN_WINDOW = 15 * 60
 LOGIN_MAX_FAILURES = 10
+MAX_CONNECTIONS = 256                  # one thread each; more are refused instead of exhausting memory
+HASH_SLOTS = threading.BoundedSemaphore(4)   # scrypt needs 32 MiB per call: cap concurrent sign-ins
 RUNNING_STALE_SECONDS = 24 * 3600      # a "running" report older than this is treated as dead
 HISTORY_DAYS = 30
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
@@ -65,6 +68,12 @@ class Config:
         self.tls_cert: str | None = raw.get("tls_cert") or None
         self.tls_key: str | None = raw.get("tls_key") or None
         self.trusted_proxy: bool = bool(raw.get("trusted_proxy", False))
+        # Networks allowed to open the web UI (sign-in, dashboard), matched against the TCP peer (like
+        # a firewall; behind a reverse proxy that is the proxy). Machine and server reports are
+        # authenticated by token and accepted from anywhere. Empty or "any" = no restriction.
+        allow = [str(a) for a in raw.get("ui_allow_from", [])]
+        self.ui_allow_from = None if not allow or "any" in allow else [
+            ipaddress.ip_network(a, strict=False) for a in allow]
         self.clients: dict[str, dict] = raw.get("clients", {})
         self.server_token_sha256: str = raw.get("server_token_sha256", "")
         self.metrics_token_sha256: str = raw.get("metrics_token_sha256", "")
@@ -72,6 +81,8 @@ class Config:
         self.telegram_token: str = notify.get("telegram_token", "")
         self.telegram_chat_ids: list[str] = [str(c) for c in notify.get("telegram_chat_ids", [])]
         self.webhook_url: str = notify.get("webhook_url", "")
+        if self.webhook_url and urllib.parse.urlsplit(self.webhook_url).scheme not in ("https", "http"):
+            raise ValueError("notify.webhook_url must be an http(s) URL")
         self.overdue_factor: float = float(raw.get("overdue_factor", 1.5))
 
     @property
@@ -85,6 +96,17 @@ class Config:
             if hmac.compare_digest(digest, meta.get("token_sha256", "")):
                 found = name
         return found
+
+    def ui_allowed(self, ip: str) -> bool:
+        if self.ui_allow_from is None:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            return False
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        return any(addr in net for net in self.ui_allow_from)
 
     def is_server_token(self, token: str) -> bool:
         return bool(self.server_token_sha256) and hmac.compare_digest(sha256(token), self.server_token_sha256)
@@ -400,7 +422,8 @@ class Notifier:
 def _post(url: str, data: bytes, ctype: str) -> None:
     try:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": ctype, "User-Agent": "restic-fleet"})
-        urllib.request.urlopen(req, timeout=15).read()
+        # telegram URL is fixed https; webhook_url is admin config, checked to be http(s) in Config
+        urllib.request.urlopen(req, timeout=15).read()  # nosec B310
     except OSError as exc:
         print(f"notification failed: {type(exc).__name__}", file=sys.stderr, flush=True)
 
@@ -530,6 +553,12 @@ DASHBOARD_BODY = """
 """
 
 
+FORBIDDEN_PAGE = page("Not allowed · restic-fleet", """
+<main class="auth"><div class="auth-card"><header><div><h1>Not available from this network</h1>
+<p>The dashboard only accepts visitors from the networks in <span class="mono">fleet_dashboard_allow_from</span>.
+Connect through your VPN, or add your network there and deploy again.</p></div></header></div></main>""")
+
+
 def login_page(error: str = "") -> bytes:
     err = f'<div class="alert" role="alert">{html.escape(error)}</div>' if error else ""
     return page("Sign in · restic-fleet", f"""
@@ -554,17 +583,23 @@ class App:
         self.cookie_name = "__Host-rfsession" if cfg.tls else "rfsession"
         self._state_cache: tuple[str, bytes] | None = None
 
-    # sessions
+    # sessions: the signature also covers the user's password hash, so changing a password (or
+    # deleting the user) signs out every existing session for that user.
+    def _session_sig(self, user: str, expires: str, stored_hash: str) -> str:
+        return hmac.new(self.secret, f"{user}|{expires}|{sha256(stored_hash)}".encode(), hashlib.sha256).hexdigest()
+
     def make_session(self, user: str) -> str:
-        payload = f"{user}|{int(time.time()) + SESSION_SECONDS}"
-        sig = hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
-        return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+        expires = str(int(time.time()) + SESSION_SECONDS)
+        sig = self._session_sig(user, expires, load_users().get(user, ""))
+        return base64.urlsafe_b64encode(f"{user}|{expires}|{sig}".encode()).decode()
 
     def read_session(self, value: str) -> str | None:
         try:
             user, expires, sig = base64.urlsafe_b64decode(value.encode()).decode().rsplit("|", 2)
-            good = hmac.new(self.secret, f"{user}|{expires}".encode(), hashlib.sha256).hexdigest()
-            if hmac.compare_digest(sig, good) and int(expires) > time.time() and user in load_users():
+            stored = load_users().get(user)
+            if stored is None or int(expires) <= time.time():
+                return None
+            if hmac.compare_digest(sig, self._session_sig(user, expires, stored)):
                 return user
         except (ValueError, UnicodeDecodeError, TypeError):
             pass
@@ -576,7 +611,7 @@ class App:
             recent = [t for t in self.failures.get(ip, []) if now - t < LOGIN_WINDOW]
             self.failures[ip] = recent
             if len(self.failures) > 10000:   # bound memory under a spray of source IPs
-                self.failures = {k: v for k, v in self.failures.items() if v}
+                self.failures = {k: v for k, v in self.failures.items() if v and now - v[-1] < LOGIN_WINDOW}
             return len(recent) >= LOGIN_MAX_FAILURES
 
     def note_failure(self, ip: str) -> None:
@@ -611,9 +646,13 @@ class App:
     def ingest_server(self, body: dict) -> None:
         if not isinstance(body, dict):
             raise BadRequest("body must be a JSON object")
+        repos = {} if body.get("repos") is None else body["repos"]
+        maintenance = {} if body.get("maintenance") is None else body["maintenance"]
+        if not isinstance(repos, dict) or not isinstance(maintenance, dict):
+            raise BadRequest("repos and maintenance must be JSON objects")
         statements = []
         now = time.time()
-        for host, repo in (body.get("repos") or {}).items():
+        for host, repo in repos.items():
             if host not in self.cfg.clients or not isinstance(repo, dict):
                 continue
             statements.append((
@@ -624,7 +663,7 @@ class App:
                 (host, now, _int(repo.get("size_bytes"), "size_bytes"), _int(repo.get("snapshots"), "snapshots"),
                  _ts(repo.get("last_snapshot"), "last_snapshot"))))
         failures = []
-        for host, m in (body.get("maintenance") or {}).items():
+        for host, m in maintenance.items():
             if host not in self.cfg.clients or not isinstance(m, dict):
                 continue
             ok = bool(m.get("ok"))
@@ -653,12 +692,21 @@ def make_handler(app: App):
         def log_message(self, fmt, *args):   # keep logs quiet and free of secrets
             pass
 
+        def setup(self):
+            super().setup()                   # applies self.timeout to the socket
+            if isinstance(self.connection, ssl.SSLSocket):
+                # TLS handshake here, in the connection's own thread and under its timeout, not in
+                # the accept loop where one silent client would block every other connection.
+                self.connection.do_handshake()
+
         # helpers
         def client_ip(self) -> str:
             if cfg.trusted_proxy:
                 fwd = self.headers.get("X-Forwarded-For", "")
                 if fwd:
-                    return fwd.split(",")[0].strip()
+                    # The proxy appends the address it saw; anything before that came from the client
+                    # and can be forged (e.g. to dodge the sign-in rate limit).
+                    return fwd.split(",")[-1].strip()
             return self.client_address[0]
 
         def send(self, status: int, body: bytes = b"", ctype: str = "text/html; charset=utf-8",
@@ -744,6 +792,8 @@ def make_handler(app: App):
                 if not app.cfg.metrics_token_sha256 or not cfg.is_metrics_token(self.bearer()):
                     return self.send(HTTPStatus.UNAUTHORIZED, b"unauthorized", "text/plain")
                 return self.send(200, metrics_text(cfg, app.store).encode(), "text/plain; version=0.0.4")
+            if path in ("/", "/login", "/api/v1/state") and not cfg.ui_allowed(self.client_address[0]):
+                return self.send(HTTPStatus.FORBIDDEN, FORBIDDEN_PAGE)
             if path == "/login":
                 return self.send(200, login_page())
             user = self.session_user()
@@ -783,6 +833,8 @@ def make_handler(app: App):
                 except (ValueError, BadRequest) as exc:
                     return self.json_response(HTTPStatus.BAD_REQUEST, {"error": str(exc)[:200]})
                 return self.json_response(200, {"ok": True})
+            if not cfg.ui_allowed(self.client_address[0]):
+                return self.send(HTTPStatus.FORBIDDEN, FORBIDDEN_PAGE)
             if not self.same_origin():
                 return self.send(HTTPStatus.FORBIDDEN, b"cross-site request refused", "text/plain")
             if path == "/logout":
@@ -795,7 +847,8 @@ def make_handler(app: App):
                 username = (form.get("username") or [""])[0].strip()
                 password = (form.get("password") or [""])[0]
                 stored = load_users().get(username)
-                ok = verify_password(password, stored or _DUMMY_HASH) and stored is not None
+                with HASH_SLOTS:
+                    ok = verify_password(password, stored or _DUMMY_HASH) and stored is not None
                 if not ok:
                     app.note_failure(ip)
                     print(f"login failed for {username[:40]!r} from {ip}", file=sys.stderr, flush=True)
@@ -806,19 +859,53 @@ def make_handler(app: App):
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], OSError):   # scanners, timeouts, failed TLS handshakes
+            return
+        super().handle_error(request, client_address)
+
+
+def make_server(cfg: Config, app: App) -> Server:
+    httpd = Server((cfg.listen, cfg.port), make_handler(app))
+    if cfg.tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cfg.tls_cert, cfg.tls_key)
+        # The handshake runs in Handler.setup (per connection, with a timeout), not in accept().
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    return httpd
+
+
 def serve() -> None:
     cfg = Config()
     os.makedirs(STATE_DIR, exist_ok=True)
     store = Store(os.path.join(STATE_DIR, "state.db"))
     notifier = Notifier(cfg, store)
     app = App(cfg, store, notifier)
-    httpd = ThreadingHTTPServer((cfg.listen, cfg.port), make_handler(app))
-    httpd.daemon_threads = True
-    if cfg.tls:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.load_cert_chain(cfg.tls_cert, cfg.tls_key)
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    httpd = make_server(cfg, app)
     threading.Thread(target=watchdog_loop, args=(cfg, store, notifier), daemon=True).start()
     scheme = "https" if cfg.tls else "http"
     print(f"restic-fleet dashboard {VERSION} on {scheme}://{cfg.listen}:{cfg.port}", flush=True)

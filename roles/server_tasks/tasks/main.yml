@@ -1,4 +1,54 @@
 ---
+# Per-machine backup_retention overrides individual keys of fleet_retention (it is merged, not a
+# replacement), so { daily: 14 } still keeps the fleet's weekly/monthly/yearly snapshots.
+- name: Work out each machine's retention policy
+  ansible.builtin.set_fact:
+    _retention: >-
+      {{ _retention | default({}) | combine({item: fleet_retention
+           | combine(hostvars[item].backup_retention | default({}))}) }}
+  loop: "{{ groups[fleet_client_group] }}"
+
+- name: Validate retention policies (a typo must not change what is kept)
+  ansible.builtin.assert:
+    that:
+      - _ret is mapping
+      - _ret | length > 0
+      - _ret.keys() | difference(_count_keys + _within_keys) | length == 0
+      - _count_keys | map('extract', _ret) | select('defined') | reject('none') | map('string')
+        | reject('match', '^-?[0-9]+$') | list | length == 0
+      - _count_keys | map('extract', _ret) | select('defined') | reject('none')
+        | map('int') | select('lt', -1) | list | length == 0
+      - _within_keys | map('extract', _ret) | select('defined') | reject('none') | map('string')
+        | reject('in', ['', '0']) | reject('match', '^([0-9]+[ymdh])+$') | list | length == 0
+    fail_msg: >-
+      {{ item }}: invalid retention {{ _ret }}. Allowed keys: {{ (_count_keys + _within_keys) | join(', ') }};
+      counts are whole numbers (-1 = keep all), within* are durations like 30d or 1y6m.
+    quiet: true
+  loop: "{{ groups[fleet_client_group] }}"
+  vars:
+    _ret: "{{ _retention[item] }}"
+    _count_keys: [last, hourly, daily, weekly, monthly, yearly]
+    _within_keys: [within, within-hourly, within-daily, within-weekly, within-monthly, within-yearly]
+
+# Maintenance and statistics run as restic-maint: it shares the `restic` group with rest-server
+# (repository files) and alone belongs to `restic-maint`, which owns the repository passwords. A
+# compromised rest-server (the network-facing process) gets ciphertext, never the passwords.
+- name: Create the maintenance group
+  ansible.builtin.group:
+    name: restic-maint
+    system: true
+
+- name: Create the maintenance user
+  ansible.builtin.user:
+    name: restic-maint
+    group: restic-maint
+    groups: [restic]
+    append: true
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ fleet_cache_dir }}"
+    create_home: false
+
 - name: Create directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -7,15 +57,31 @@
     group: "{{ item.group }}"
     mode: "{{ item.mode }}"
   loop:
-    - { path: "{{ fleet_etc }}/repos", owner: root, group: restic, mode: "0750" }
-    - { path: "{{ fleet_cache_dir }}", owner: restic, group: restic, mode: "0750" }
+    - { path: "{{ fleet_etc }}/repos", owner: root, group: restic-maint, mode: "0750" }
+    - { path: "{{ fleet_cache_dir }}", owner: restic-maint, group: restic-maint, mode: "0750" }
+
+- name: Hand the restic cache (written by the `restic` user before) to the maintenance user
+  ansible.builtin.file:
+    path: "{{ fleet_cache_dir }}"
+    state: directory
+    owner: restic-maint          # owner only: new cache files get group restic (the unit's Group=)
+    recurse: true
+
+- name: Install the fleet CA for reporting to the dashboard (the TLS directory holds the key)
+  ansible.builtin.copy:
+    src: "{{ fleet_tls_dir }}/ca.crt"
+    dest: "{{ fleet_etc }}/ca.crt"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
 
 - name: Place repository passwords for server-side maintenance
   ansible.builtin.copy:
     content: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/repo-password/' ~ item ~ ' ' ~ fleet_secret_spec) }}"
     dest: "{{ fleet_etc }}/repos/{{ item }}.pass"
     owner: root
-    group: restic
+    group: restic-maint
     mode: "0640"
   loop: "{{ groups[fleet_client_group] }}"
   no_log: true
@@ -48,7 +114,7 @@
     content: "{{ lookup('ansible.builtin.password', fleet_credentials_dir ~ '/server-report-token ' ~ fleet_secret_spec) }}"
     dest: "{{ fleet_etc }}/server-report.token"
     owner: root
-    group: restic
+    group: restic-maint
     mode: "0640"
   no_log: true
 
@@ -57,7 +123,7 @@
     content: "{{ _server_config | to_nice_json }}\n"
     dest: "{{ fleet_etc }}/server.json"
     owner: root
-    group: restic
+    group: restic-maint
     mode: "0640"
   vars:
     _server_config:
@@ -66,13 +132,12 @@
       repo_pass_dir: "{{ fleet_etc }}/repos"
       token_file: "{{ fleet_etc }}/server-report.token"
       dashboard_url: "https://127.0.0.1:{{ fleet_dashboard_port }}"
-      dashboard_cacert: "{{ fleet_tls_dir }}/ca.crt"
+      dashboard_cacert: "{{ fleet_etc }}/ca.crt"
       check_subset: "{{ fleet_check_subset }}"
+      restore_test_days: "{{ fleet_restore_test_days | int }}"
       retry_lock: "1h"
-      clients: >-
-        {{ dict(groups[fleet_client_group]
-                | zip(groups[fleet_client_group] | map('extract', hostvars, 'backup_retention')
-                      | map('default', fleet_retention))) }}
+      verify_snapshot_times: "{{ fleet_maintenance_verify_snapshot_times | bool }}"
+      clients: "{{ _retention }}"
 
 - name: Install the server tasks script
   ansible.builtin.copy:

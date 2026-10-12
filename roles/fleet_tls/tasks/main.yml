@@ -22,7 +22,7 @@
     set -eu
     umask 077
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key
-    openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj "/CN={{ fleet_name }} CA" \
+    openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj {{ ('/CN=' ~ fleet_name ~ ' CA') | quote }} \
       -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
       -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca.crt
     chmod 0644 ca.crt
@@ -53,8 +53,8 @@
     set -eu
     umask 077
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key.new
-    openssl req -new -key server.key.new -subj "/CN={{ fleet_server_address }}" -out server.csr
-    printf '%s\n' "subjectAltName={{ _san }}" "extendedKeyUsage=serverAuth" \
+    openssl req -new -key server.key.new -subj {{ ('/CN=' ~ fleet_server_address) | quote }} -out server.csr
+    printf '%s\n' {{ ('subjectAltName=' ~ _san) | quote }} "extendedKeyUsage=serverAuth" \
       "keyUsage=critical,digitalSignature" "basicConstraints=critical,CA:FALSE" > server.ext
     openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 -sha256 \
       -extfile server.ext -out server.crt.new

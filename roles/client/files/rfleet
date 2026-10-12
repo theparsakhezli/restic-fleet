@@ -33,8 +33,33 @@ case "${1:-help}" in
     exec journalctl -u restic-fleet-backup.service --no-pager -n 200 "$@" ;;
   db)
     name=${2:?usage: rfleet db NAME [SNAPSHOT] > file}
-    [ -f "/etc/restic-fleet/dumps/$name.filename" ] || { echo "no database job named '$name'" >&2; exit 2; }
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ -f "/etc/restic-fleet/dumps/$name.filename" ] \
+      || { echo "no database job named '$name'" >&2; exit 2; }
     exec restic dump --tag "$name" "${3:-latest}" "/$(cat "/etc/restic-fleet/dumps/$name.filename")" ;;
+  restore)
+    # restic overwrites existing files at the target by default. Restoring straight over the live
+    # system is occasionally right, but never by accident: ask first (add --dry-run to preview).
+    target="" dry=0 prev=""
+    for a in "$@"; do
+      case $a in
+        --target=*) target=${a#--target=} ;;
+        --dry-run) dry=1 ;;
+      esac
+      case $prev in --target|-t) target=$a ;; esac
+      prev=$a
+    done
+    real=$(realpath -m -- "${target:-.}")
+    case $real in
+      /|/etc|/usr|/var|/boot|/bin|/sbin|/lib|/lib64|/root|/home|/srv|/opt)
+        if [ "$dry" = 0 ]; then
+          echo "This restores over the live system directory $real and overwrites files there." >&2
+          echo "Restore to an empty directory (e.g. --target /tmp/restore) unless you really mean it." >&2
+          [ -t 0 ] || { echo "refusing without a terminal to confirm" >&2; exit 2; }
+          read -r -p "Type 'overwrite $real' to continue: " answer
+          [ "$answer" = "overwrite $real" ] || { echo "aborted" >&2; exit 2; }
+        fi ;;
+    esac
+    exec restic "$@" ;;
   help|-h|--help)
     sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)

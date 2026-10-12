@@ -31,7 +31,7 @@ choices are yours.
 
 | If an attacker controls… | …they can | …but they cannot |
 |---|---|---|
-| **a machine** | read that machine's backups; add new snapshots; fill its repository with junk | delete or rewrite its existing snapshots (append-only); see or touch other machines' repositories (private repos + per-machine login) |
+| **a machine** | read that machine's backups; add new snapshots; fill its repository with junk | delete or rewrite its existing snapshots (append-only); trick retention into deleting them with back-dated snapshots (maintenance refuses to prune, see below); see or touch other machines' repositories (private repos + per-machine login) |
 | **the backup server** | delete or corrupt any repository; with maintenance **on**, read all backups | with maintenance **off**, read any backup (it never has the repository passwords) |
 | **the dashboard** (its process) | read status data; send fake alerts; show a fake status | read or change any repository (it runs as its own user and has no repository credentials); learn machine tokens (it stores only their SHA-256 hashes) |
 | **a dashboard login** | see status, sizes, job names, error messages | change anything: the dashboard is read-only |
@@ -51,11 +51,16 @@ Retention and pruning *delete* data, so they can't run through the append-only s
 with the repository password has to run them somewhere. restic-fleet gives you the choice:
 
 **`fleet_server_maintenance: true` (default).** The backup server keeps each repository's password
-(`/etc/restic-fleet/repos/<machine>.pass`, `root:restic`, `0640`) and prunes and checks locally
-once a week.
+(`/etc/restic-fleet/repos/<machine>.pass`, `root:restic-maint`, `0640`) and prunes and checks
+locally once a week, as the dedicated `restic-maint` user. rest-server, the network-facing
+process, runs as `restic` and **can't read those passwords**: breaking into rest-server yields
+ciphertext only. Every 4 weeks (`fleet_restore_test_days`) maintenance also restores the latest
+snapshot of every job in full, streamed and discarded, to prove the backups come back whole.
 
-- ✅ Retention happens automatically, and weekly integrity checks read real data.
-- ⚠️ Whoever owns the backup server can decrypt the backups.
+- ✅ Retention happens automatically, weekly integrity checks read real data, and restores are tested.
+- ⚠️ Whoever gets root on the backup server can decrypt the backups.
+
+`./setup.sh new` asks which mode you want, and every deploy prints the mode in use.
 
 **`fleet_server_maintenance: false`.** The server never sees a repository password.
 
@@ -69,6 +74,13 @@ once a week.
     forget --prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --group-by host,paths,tags
   restic -r /srv/restic-fleet/web1 --password-command "…" check --read-data-subset 5%
   ```
+
+**Retention can't be turned against you.** restic's `--keep-*` rules trust each snapshot's
+timestamp, and the timestamp is chosen by the machine. A compromised machine could upload snapshots
+dated into each daily/weekly/monthly slot so the next prune keeps those and deletes the real ones.
+Before every prune, maintenance compares each snapshot's claimed time with the time the server
+stored it (which the machine can't set). On a mismatch it prunes nothing for that machine and
+reports a maintenance failure. Retention settings are validated on deploy as well.
 
 Choose **true** when you trust the backup server at least as much as the machines, which is the
 usual case for a team running its own servers. Choose **false** when the backup server is hosted
@@ -111,10 +123,14 @@ How they are handled:
 
 - A Python standard-library server. No web framework, no npm packages, and nothing loaded from
   other sites.
-- **Sign-in:** scrypt password hashes; 10 failed attempts per address in 15 minutes locks that
-  address out; the same error message for a wrong user and a wrong password.
+- **Sign-in:** scrypt password hashes (at most 4 checked at once, so a flood of sign-ins can't
+  exhaust memory); 10 failed attempts per address in 15 minutes locks that address out (behind
+  `fleet_dashboard_trusted_proxy`, the address is the last `X-Forwarded-For` hop, the one your proxy
+  added); the same error message for a wrong user and a wrong password.
 - **Sessions:** HMAC-signed, 12 hours, in a `__Host-` cookie that is `HttpOnly`, `Secure` and
-  `SameSite=Strict`.
+  `SameSite=Strict`. Changing a user's password signs out all of that user's sessions.
+- **Connections:** TLS handshakes run per connection with a 30-second timeout, and at most 256
+  connections are served at once, so slow or silent clients can't stall the dashboard.
 - **Forms:** every POST must come from the same origin (checked against `Origin`/`Referer`), which
   blocks cross-site request forgery.
 - **Headers:**
@@ -137,7 +153,7 @@ Every long-running service runs under systemd with a dedicated user and sandboxi
 |---|---|---|
 | `restic-fleet-rest-server` | `restic` | writes only to `fleet_data_dir`; `ProtectSystem=strict`, `NoNewPrivileges`, no capabilities |
 | `restic-fleet-dashboard` | `rfdash` | writes only to its state dir; no capabilities; `MemoryDenyWriteExecute`; syscall filter; `UMask=0077` |
-| `restic-fleet-collect` / `-maintain` | `restic` | writes only to the repositories and its cache; `ProtectSystem=strict`, no capabilities, private `/tmp` |
+| `restic-fleet-collect` / `-maintain` | `restic-maint` (group `restic`) | the only user that can read repository passwords; writes only to the repositories and its cache; `ProtectSystem=strict`, no capabilities, private `/tmp` |
 | `restic-fleet-backup` (machines) | root (must read everything it backs up) | low CPU/IO priority; runs once and exits |
 
 ## Supply chain
@@ -148,11 +164,15 @@ Every long-running service runs under systemd with a dedicated user and sandboxi
 - The Ansible roles use only `ansible.builtin` modules, with no third-party collections.
 - The dashboard and server scripts use only the Python standard library.
 - The controller installs `ansible-core` from PyPI into a local virtualenv, within a version range.
+- CI pins every GitHub Action to a full commit SHA (kept current by Dependabot), runs with
+  read-only permissions, and scans every change with gitleaks (full history), bandit and pip-audit.
 
 ## Checklist for production
 
 - [ ] `credentials/` backed up somewhere safe and **not** in a public repository
 - [ ] Backup server: SSH keys only, few admins, automatic security updates
+- [ ] Dashboard reachable only from your networks: `fleet_dashboard_allow_from` (private and VPN
+      ranges by default; the dashboard enforces it even without a firewall)
 - [ ] Firewall on the backup server: 8000 and 8443 only from where they're needed
       (`fleet_dashboard_allow_from`)
 - [ ] Chose `fleet_server_maintenance` deliberately

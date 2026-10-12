@@ -11,13 +11,17 @@ Group=restic
 # --append-only: clients can add backups but never delete or rewrite them, so a compromised
 #   client cannot destroy its history. Pruning runs locally on this server (restic-fleet-maintain).
 # --private-repos: each client can only reach the repository named after its own user.
+# --group-accessible-repos (+ UMask=0007): files are shared with the `restic` group, so maintenance
+#   can run as its own user (restic-maint), the only one able to read the repository passwords.
+#   This network-facing service never can.
 ExecStart=/usr/local/bin/rest-server \
   --path {{ fleet_data_dir }} \
   --listen {{ fleet_rest_listen }}:{{ fleet_rest_port }} \
   --tls --tls-cert {{ fleet_tls_dir }}/server.crt --tls-key {{ fleet_tls_dir }}/server.key \
   --htpasswd-file {{ fleet_etc }}/rest-server.htpasswd \
-  --append-only --private-repos{% if fleet_rest_max_size %} --max-size {{ fleet_rest_max_size }}{% endif %}
+  --append-only --private-repos --group-accessible-repos{% if fleet_rest_max_size %} --max-size {{ fleet_rest_max_size }}{% endif %}
 
+UMask=0007
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

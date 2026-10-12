@@ -65,7 +65,9 @@ backup_clients:
 | `backup_pre_hook` / `backup_post_hook` | `""` | Shell commands run before and after the backup. See [Hooks](#hooks). |
 | `fleet_source_address` | `ansible_host` | The address this machine's traffic *comes from*, if different from how you SSH in. Used for firewall rules. |
 
-A machine needs `backup_paths` or `backup_databases`, or both. The machine's inventory name
+A machine needs `backup_paths` or `backup_databases`, or both. If a path in `backup_paths` doesn't
+exist when the backup runs, everything else is still backed up, but the files job is reported as
+**failed** and the systemd unit fails, so a typo or a moved folder can't go unnoticed. The machine's inventory name
 becomes its repository name, so renaming it later starts a new, empty repository.
 
 ## Schedules
@@ -104,7 +106,19 @@ fleet_retention:          # fleet default
 
 This keeps the newest snapshot of each of the last 7 days, 4 weeks, 6 months and 1 year: about
 18 restore points spread over a year. Override it for one machine with `backup_retention`, and set
-only the keys you want to change.
+only the keys you want to change: it is merged into `fleet_retention`, so `{ daily: 14 }` still keeps
+the weekly, monthly and yearly snapshots. Set a key to `0` to turn it off for that machine.
+
+Allowed keys are `last`, `hourly`, `daily`, `weekly`, `monthly`, `yearly` (whole numbers; `-1` keeps
+all) and `within`, `within-hourly`, … `within-yearly` (durations such as `30d` or `1y6m`). The deploy
+stops on anything else, so a typo like `dialy` can't quietly change what is kept.
+
+Before pruning, maintenance checks that every snapshot's time matches when the server actually
+received it. If a machine uploads snapshots dated in the past or future (a broken clock, or an
+attacker trying to push real backups out of the retention window), retention is **skipped** for that
+machine, nothing is forgotten, and the dashboard shows a maintenance failure listing the snapshots.
+The integrity check still runs. If you deliberately add old snapshots on the server (`restic copy`,
+`restic rewrite`), set `fleet_maintenance_verify_snapshot_times: false`.
 
 Pruning runs on the server, not on the machines, because machines are append-only and can't delete
 anything. If you set `fleet_server_maintenance: false`, nothing is pruned automatically. See
@@ -144,6 +158,8 @@ Put these in `inventories/<fleet>/group_vars/all/main.yml`. The source of truth,
 | `fleet_server_maintenance` | `true` | Prune and check on the server. See [the trade-off](security.md#the-maintenance-trade-off). |
 | `fleet_maintenance_schedule` | `Sun *-*-* 04:00:00` | When maintenance runs. |
 | `fleet_check_subset` | `5%` | How much real data `restic check` reads each week. Use `100%` for a full read. |
+| `fleet_restore_test_days` | `28` | How often maintenance restores the latest snapshot of every job in full (streamed and discarded, no disk space needed). A failure shows as a maintenance failure. `0` turns it off. |
+| `fleet_maintenance_verify_snapshot_times` | `true` | Skip retention when a snapshot's time doesn't match when the server received it. See [Retention](#retention). |
 | `fleet_collect_schedule` | `*:0/10` | How often repository sizes are refreshed. |
 | `fleet_retention` | see [Retention](#retention) | Default retention. |
 
@@ -155,7 +171,7 @@ Put these in `inventories/<fleet>/group_vars/all/main.yml`. The source of truth,
 | `fleet_dashboard_listen` | `0.0.0.0` | Bind address. Use `127.0.0.1` behind a local reverse proxy. |
 | `fleet_dashboard_admin` | `admin` | Name of the admin user created on deploy. |
 | `fleet_dashboard_url` | `https://<server>:8443` | The address people use, printed after each deploy. Set it when you use a reverse proxy. Machines always report to the server directly. |
-| `fleet_dashboard_allow_from` | `["any"]` | Who may open the dashboard (ufw), as a list of CIDRs. |
+| `fleet_dashboard_allow_from` | private, VPN and loopback ranges | Who may open the dashboard's sign-in page and status, as a list of IPs/CIDRs, or `["any"]`. Enforced by the dashboard itself (against the connecting address, i.e. your proxy if you use one) and by ufw when active. Machines report from anywhere with their token. |
 | `fleet_dashboard_trusted_proxy` | `false` | Trust `X-Forwarded-For` from a reverse proxy. |
 | `fleet_metrics_enabled` | `false` | Expose `/metrics` for Prometheus. |
 

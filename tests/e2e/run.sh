@@ -98,6 +98,8 @@ node web1 "set -a; . /etc/restic-fleet/fleet.env; set +a; \
 node web1 "stat -c '%a %U' /etc/restic-fleet/fleet.env /etc/restic-fleet/repo.pass" | grep -qv '^600 root' \
   && die "client secrets not 0600 root" || ok "client secrets are 0600 root"
 node server "grep -qF ':\$2y\$' /etc/restic-fleet/rest-server.htpasswd" && ok "rest-server passwords are bcrypt" || die "htpasswd"
+node server "runuser -u restic -- cat /etc/restic-fleet/repos/web1.pass >/dev/null 2>&1" \
+  && die "rest-server's user can read repository passwords" || ok "rest-server's user cannot read repository passwords"
 token=$(cred report-token/web1)
 node server "grep -qF '$token' /etc/restic-fleet/dashboard.json" && die "plain report token stored on the server" \
   || ok "dashboard stores only token hashes, never the tokens"
@@ -125,6 +127,34 @@ echo "$state" | jq_ -e '.hosts[] | select(.name=="db1") | .maintenance.ok == tru
   && ok "dashboard: maintenance result recorded" || die "maintenance not on dashboard"
 echo "$state" | jq_ -e '[.hosts[].repo.snapshots] | all(. >= 1)' >/dev/null \
   && ok "dashboard: repository statistics collected" || die "repo stats missing"
+echo "$state" | jq_ -e '[.hosts[].maintenance.message] | all(test("restore test passed"))' >/dev/null \
+  && ok "maintenance restored the latest snapshots in full" \
+  || die "restore test missing: $(echo "$state" | jq_ -c '[.hosts[].maintenance.message]')"
+
+step "Retention can't be gamed by a compromised client"
+# A hacked client can't delete through the append-only server, but it can upload back-dated
+# snapshots so that the next forget keeps those and drops the real ones. Maintenance must notice.
+before=$(node web1 "rfleet snapshots --json | jq length")
+node web1 "rfleet backup --host web1 --tag files --time '2020-01-01 00:00:00' /etc/hostname >/dev/null 2>&1"
+node server "systemctl start restic-fleet-maintain.service" 2>/dev/null \
+  && die "maintenance accepted a back-dated snapshot" || true
+node server "journalctl -u restic-fleet-maintain --no-pager -n 20" | grep -q "web1: FAILED" \
+  && ok "maintenance flags the back-dated snapshot" || die "no maintenance failure for web1"
+after=$(node web1 "rfleet snapshots --json | jq length")
+[ "$after" = $((before + 1)) ] && ok "nothing was forgotten ($after snapshots)" || die "snapshots $before -> $after"
+state=$(ctl "c=\$(mktemp); curl -s --cacert tests/e2e/inventory/credentials/ca.crt -c \$c -o /dev/null \
+  -H 'Origin: https://server:8443' --data-urlencode username=admin --data-urlencode password='$pw' https://server:8443/login; \
+  curl -s --cacert tests/e2e/inventory/credentials/ca.crt -b \$c https://server:8443/api/v1/state")
+echo "$state" | jq_ -e '(.hosts[] | select(.name=="web1") | .maintenance.ok == false)
+                        and (.hosts[] | select(.name=="db1") | .maintenance.ok == true)' >/dev/null \
+  && ok "dashboard: web1 maintenance failed, db1 unaffected" || die "maintenance results on dashboard"
+
+step "A missing backup path fails the backup"
+node web1 "echo /srv/does-not-exist >> /etc/restic-fleet/paths.txt"
+node web1 "systemctl start restic-fleet-backup.service" 2>/dev/null && die "backup with a missing path succeeded" || true
+node web1 "journalctl -u restic-fleet-backup --no-pager -n 30" | grep -q "do not exist: /srv/does-not-exist" \
+  && ok "the files job failed and names the missing path" || die "missing path not reported"
+node web1 "sed -i '\#/srv/does-not-exist#d' /etc/restic-fleet/paths.txt"
 
 step "Idempotency"
 out=$(ctl "ansible-playbook -i tests/e2e/inventory site.yml" | tail -n 8)

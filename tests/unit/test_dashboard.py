@@ -7,6 +7,10 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
+import socket
+import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -229,6 +233,105 @@ class DashboardTest(unittest.TestCase):
         big = b"{" + b" " * (self.rfd.MAX_BODY + 10) + b"}"
         resp, _ = self.request("POST", "/api/v1/report", big, {"Authorization": f"Bearer {TOKENS['web1']}"})
         self.assertEqual(resp.status, 413)
+
+    def test_password_change_ends_existing_sessions(self):
+        cookie = self.login()
+        resp, _ = self.request("GET", "/api/v1/state", headers={"Cookie": cookie})
+        self.assertEqual(resp.status, 200)
+        users = self.rfd.load_users()
+        original = users["admin"]
+        try:
+            users["admin"] = self.rfd.hash_password("a brand new password")
+            self.rfd.save_users(users)
+            resp, _ = self.request("GET", "/api/v1/state", headers={"Cookie": cookie})
+            self.assertEqual(resp.status, 401, "a session must not outlive the password it was issued for")
+        finally:
+            users["admin"] = original
+            self.rfd.save_users(users)
+
+    def test_forwarded_for_uses_the_proxy_hop(self):
+        # Behind a trusted proxy, only the last X-Forwarded-For entry (added by the proxy) counts;
+        # rotating a forged first entry must not reset the sign-in rate limit.
+        self.cfg.trusted_proxy = True
+        self.app.failures.clear()
+        bad = urllib.parse.urlencode({"username": "admin", "password": "nope"}).encode()
+        try:
+            for i in range(self.rfd.LOGIN_MAX_FAILURES):
+                self.request("POST", "/login", bad, {"Origin": f"http://127.0.0.1:{self.port}",
+                                                      "Host": f"127.0.0.1:{self.port}",
+                                                      "X-Forwarded-For": f"198.51.100.{i}, 192.0.2.50"})
+            resp, _ = self.request("POST", "/login", bad, {"Origin": f"http://127.0.0.1:{self.port}",
+                                                            "Host": f"127.0.0.1:{self.port}",
+                                                            "X-Forwarded-For": "198.51.100.200, 192.0.2.50"})
+            self.assertEqual(resp.status, 429)
+        finally:
+            self.cfg.trusted_proxy = False
+            self.app.failures.clear()
+
+    def test_server_report_rejects_wrong_shapes(self):
+        for body in ({"repos": []}, {"maintenance": "x"}):
+            resp, _ = self.request("POST", "/api/v1/server-report", body,
+                                   {"Authorization": f"Bearer {SERVER_TOKEN}"})
+            self.assertEqual(resp.status, 400)
+
+    def test_ui_allowlist(self):
+        self.cfg.ui_allow_from = [self.rfd.ipaddress.ip_network("10.0.0.0/8")]
+        try:
+            for path in ("/", "/login", "/api/v1/state"):
+                resp, _ = self.request("GET", path)
+                self.assertEqual(resp.status, 403, path)
+            resp, _ = self.request("POST", "/login", b"username=admin&password=x",
+                                   {"Origin": f"http://127.0.0.1:{self.port}", "Host": f"127.0.0.1:{self.port}"})
+            self.assertEqual(resp.status, 403)
+            resp, _ = self.report("web1")
+            self.assertEqual(resp.status, 200, "machine reports are token-authenticated, not network-restricted")
+            resp, _ = self.request("GET", "/healthz")
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(self.cfg.ui_allowed("10.1.2.3"))
+            self.assertTrue(self.cfg.ui_allowed("::ffff:10.1.2.3"))
+            self.assertFalse(self.cfg.ui_allowed("203.0.113.5"))
+            self.assertFalse(self.cfg.ui_allowed("not an ip"))
+        finally:
+            self.cfg.ui_allow_from = None
+        path = os.path.join(self.tmp.name, "allow.json")
+        with open(path, "w") as fh:
+            json.dump({"ui_allow_from": ["any", "10.0.0.0/8"]}, fh)
+        self.assertIsNone(self.rfd.Config(path).ui_allow_from)
+
+    def test_webhook_must_be_http(self):
+        path = os.path.join(self.tmp.name, "bad.json")
+        with open(path, "w") as fh:
+            json.dump({"notify": {"webhook_url": "file:///etc/passwd"}}, fh)
+        with self.assertRaises(ValueError):
+            self.rfd.Config(path)
+
+    @unittest.skipUnless(shutil.which("openssl"), "needs the openssl CLI to make a test certificate")
+    def test_silent_tls_client_does_not_block_others(self):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        crt, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                        "-nodes", "-keyout", key, "-out", crt, "-days", "1", "-subj", "/CN=127.0.0.1"],
+                       check=True, capture_output=True)
+        self.cfg.tls_cert, self.cfg.tls_key = crt, key
+        try:
+            httpd = self.rfd.make_server(self.cfg, self.app)
+        finally:
+            self.cfg.tls_cert = self.cfg.tls_key = None
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        silent = socket.create_connection(("127.0.0.1", port))   # connects, never says hello
+        try:
+            time.sleep(0.3)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+            conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=ctx)
+            conn.request("GET", "/healthz")
+            self.assertEqual(conn.getresponse().status, 200)
+            conn.close()
+        finally:
+            silent.close()
+            httpd.shutdown()
+            httpd.server_close()
 
     def test_notification_dedup(self):
         sent = []

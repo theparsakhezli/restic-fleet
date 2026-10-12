@@ -119,7 +119,7 @@ front of it:
 
 ```yaml
 # group_vars/all/main.yml
-fleet_dashboard_trusted_proxy: true               # rate limiting uses X-Forwarded-For
+fleet_dashboard_trusted_proxy: true               # rate limiting uses the last X-Forwarded-For hop
 fleet_dashboard_url: https://backups.example.com  # shown after each deploy
 fleet_dashboard_allow_from: ["127.0.0.1/32"]      # if the proxy runs on the same server
 ```

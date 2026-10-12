@@ -25,6 +25,7 @@ fi
 
 RUN_ID="$(date +%s)-$$"
 FAILED=0
+MISSING=""                # set around the files job: configured paths that do not exist
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -49,7 +50,8 @@ run_job() {  # job-name restic-backup-args...
   started=$(date +%s)
   report "$job" running "$started"
   set +e
-  restic backup --json --quiet --host "$FLEET_HOST" "$@" >"$TMP/out" 2>"$TMP/err"
+  # --retry-lock: wait (instead of failing) while the server's weekly prune holds the repository
+  restic backup --json --quiet --retry-lock 1h --host "$FLEET_HOST" "$@" >"$TMP/out" 2>"$TMP/err"
   rc=$?
   set -e
   finished=$(date +%s)
@@ -58,9 +60,26 @@ run_job() {  # job-name restic-backup-args...
                 "$TMP/out" 2>/dev/null || true; cat "$TMP/err"; } | tail -c 1500)
   case $rc in
     0) status=success; msg="" ;;
-    3) status=warning; msg="some files could not be read: $errors" ;;
+    3) status=warning; msg="snapshot saved, but some files could not be read: $errors" ;;
+    10) status=failed; msg="repository does not exist: $errors"; FAILED=1 ;;
+    11) status=failed; msg="repository is locked (maintenance running longer than 1h?): $errors"; FAILED=1 ;;
+    12) status=failed; msg="wrong repository password: $errors"; FAILED=1 ;;
+    130) status=failed; msg="interrupted: $errors"; FAILED=1 ;;
     *) status=failed;  msg="restic exit $rc: $errors"; FAILED=1 ;;
   esac
+  # A snapshot that contains nothing (a dump command that printed nothing, folders that are empty
+  # or gone) "succeeds" as far as restic is concerned, but restores nothing: say so.
+  if [ "$status" != failed ]; then
+    if [ -z "$summary" ]; then
+      status=warning; msg="restic reported no summary; check the snapshot. $msg"
+    elif [ "$(jq -r '.total_bytes_processed // 0' <<<"$summary")" = 0 ]; then
+      status=warning; msg="the backup is empty (0 bytes). $msg"
+    fi
+  fi
+  if [ -n "${MISSING:-}" ]; then
+    status=failed; msg="configured path(s) do not exist: $MISSING (everything else was backed up). $msg"
+    FAILED=1
+  fi
   report "$job" "$status" "$started" "$finished" "$summary" "$msg"
   printf '%-24s %s\n' "$job" "$status"
   [ "$status" = success ] || printf '%s\n' "$msg" >&2
@@ -82,11 +101,24 @@ if ! run_hook pre; then
 fi
 
 if [ -s "$CONF/paths.txt" ]; then
+  # A configured path that doesn't exist (a typo, a moved folder) is a broken backup, not a
+  # warning: restic would save the rest and exit 3. Back up what exists, then fail the job.
+  missing=()
+  while IFS= read -r p || [ -n "$p" ]; do
+    case $p in ''|'#'*) continue ;; esac
+    if [[ $p == *[*?[]* ]]; then
+      compgen -G "$p" >/dev/null || missing+=("$p")
+    elif [ ! -e "$p" ] && [ ! -L "$p" ]; then
+      missing+=("$p")
+    fi
+  done <"$CONF/paths.txt"
   args=(--files-from "$CONF/paths.txt" --tag files)
   [ -s "$CONF/excludes.txt" ] && args+=(--exclude-file "$CONF/excludes.txt")
   [ "${FLEET_EXCLUDE_CACHES:-1}" = 1 ] && args+=(--exclude-caches)
   [ "${FLEET_ONE_FILE_SYSTEM:-0}" = 1 ] && args+=(--one-file-system)
+  MISSING=${missing[*]:-}
   run_job files "${args[@]}"
+  MISSING=""
 fi
 
 for dump in "$CONF"/dumps/*.sh; do

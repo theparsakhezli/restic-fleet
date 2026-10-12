@@ -38,19 +38,37 @@ fleet_dashboard_trusted_proxy: false     # true behind your own reverse proxy (t
 fleet_server_maintenance: true
 fleet_maintenance_schedule: "Sun *-*-* 04:00:00"
 fleet_collect_schedule: "*:0/10"
-fleet_check_subset: "5%"
+fleet_check_subset: "5%"                 # share of pack data `restic check` reads each week
+# Every N days, maintenance also restores the latest snapshot of every job in full (streamed and
+# discarded: no disk space needed) to prove backups come back whole. 0 = never.
+fleet_restore_test_days: 28
 fleet_retention:                         # restic --keep-* flags; per-host override: backup_retention
-  last: 0
-  hourly: 0
+  last: 0                                # keys: last hourly daily weekly monthly yearly (counts, -1 = all)
+  hourly: 0                              #   and within, within-daily, ... (durations like 30d, 1y6m)
   daily: 7
   weekly: 4
   monthly: 6
   yearly: 1
+# Before pruning, compare each snapshot's time with when the server received it and skip retention
+# (reporting a maintenance failure) if they disagree: stops a compromised machine from uploading
+# back-dated snapshots that would push its real backups out of the retention window. Turn off only
+# if you deliberately add old snapshots to repositories (restic copy/rewrite on the server).
+fleet_maintenance_verify_snapshot_times: true
 
-# Firewall: when ufw is installed and active, only allow clients to reach rest-server and
-# only these CIDRs to reach the dashboard. Nothing is enabled if ufw is inactive.
+# Who may open the dashboard's web UI (sign-in page and status). Enforced by the dashboard itself,
+# and also by ufw when it is installed and active. Machines report to it from anywhere with their
+# token. The default is private, VPN and loopback addresses; ["any"] opens it to the internet.
+fleet_dashboard_allow_from:
+  - 127.0.0.0/8
+  - ::1/128
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 100.64.0.0/10                        # carrier-grade NAT range, used by Tailscale and others
+  - fc00::/7
+# Firewall: when ufw is installed and active, only allow clients to reach rest-server, and only
+# clients and fleet_dashboard_allow_from to reach the dashboard. Nothing is enabled if ufw is inactive.
 fleet_manage_ufw: true
-fleet_dashboard_allow_from: ["any"]
 
 # --- clients -------------------------------------------------------------------------------
 fleet_backup_schedule: "*-*-* 02:30:00"  # systemd OnCalendar; per-host override: backup_schedule

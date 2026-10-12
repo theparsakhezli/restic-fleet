@@ -5,17 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: nothing in this workflow writes to the repository or needs secrets.
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to full commit SHAs (tags can be moved); Dependabot updates them.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: ShellCheck
         run: shellcheck -x setup.sh tests/e2e/run.sh roles/client/files/restic-fleet-backup roles/client/files/rfleet roles/rest_server/files/htpasswd-sync
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: ansible-lint
@@ -25,14 +34,46 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests/unit -v
 
-  e2e:
-    needs: lint
+  security:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0              # gitleaks scans the whole history, not just this commit
+      - name: Secret scan (gitleaks, full history)
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --redact --no-banner --exit-code 1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install scanners
+        run: pip install "bandit==1.9.4" "pip-audit==2.10.1"
+      - name: Python static analysis (bandit, medium+ severity)
+        run: >-
+          bandit --severity-level medium --confidence-level medium
+          roles/dashboard/files/restic_fleet_dashboard.py roles/server_tasks/files/restic-fleet-server
+      - name: Known vulnerabilities in the controller's Python dependencies (pip-audit)
+        run: |
+          for spec in "ansible-core>=2.16,<2.17" "ansible-core>=2.19,<2.20"; do
+            echo "$spec" > /tmp/req.txt
+            pip-audit --requirement /tmp/req.txt --strict
+          done
+
+  e2e:
+    needs: [lint, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       matrix:
         ansible: ["ansible-core>=2.16,<2.17", "ansible-core>=2.19,<2.20"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: End-to-end test
         env:
           ANSIBLE_CORE: ${{ matrix.ansible }}

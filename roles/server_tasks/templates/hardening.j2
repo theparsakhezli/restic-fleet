@@ -1,6 +1,8 @@
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
+# repository files must stay readable for rest-server (group restic)
+UMask=0007
 ReadWritePaths={{ fleet_data_dir }} {{ fleet_cache_dir }}
 ProtectHome=yes
 PrivateTmp=yes
