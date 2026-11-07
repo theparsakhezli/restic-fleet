@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # Third-party actions are pinned to full commit SHAs (tags can be moved); Dependabot updates them.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: ShellCheck
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0              # gitleaks scans the whole history, not just this commit
@@ -71,7 +71,7 @@ jobs:
       matrix:
         ansible: ["ansible-core>=2.16,<2.17", "ansible-core>=2.19,<2.20"]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: End-to-end test
