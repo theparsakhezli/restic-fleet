@@ -42,6 +42,10 @@ All notable changes to restic-fleet are listed here. The format follows
   the restic/rest-server downloads are retried. On hosts without `python3-apt`, Ansible installs it
   after an `apt-get update` that exits 0 even when nothing was downloaded, which used to fail with
   "Unable to locate package python3-apt".
+- Deploys to hosts whose apt package lists were wiped recently (fresh container or cloud images)
+  failed with "No package matching 'bzip2'": the empty lists directory looked fresh, so apt skipped
+  the update. With no package lists, the index is now always refreshed. The e2e test reproduces this
+  case on every run, so Docker Desktop behaves like the CI runners.
 - The e2e test image includes `python3-apt` (as Ubuntu server images do), and its apt steps retry
   and fail on any download error; CI runs both Ansible versions to the end (`fail-fast: false`).
 - A path in `backup_paths` that doesn't exist now fails the files job and the systemd unit (it was

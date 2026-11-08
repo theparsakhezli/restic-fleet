@@ -41,6 +41,11 @@ for n in server web1 db1; do
   done
 done
 ok "containers up (systemd running)"
+# Freshly built images have no apt package lists, but depending on the Docker storage driver the
+# empty lists directory looks either weeks old (Docker Desktop) or seconds old (GitHub's runners).
+# "Seconds old" is the hard case: apt's cache_valid_time check thinks the cache is fresh. Force it
+# everywhere so a local run behaves like CI.
+for n in server web1 db1; do node "$n" "touch /var/lib/apt/lists"; done
 
 mkdir -p .ssh
 ctl "ssh-keygen -q -t ed25519 -N '' -f /work/tests/e2e/.ssh/id_ed25519 <<<y >/dev/null 2>&1 || true"
