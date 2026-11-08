@@ -3,6 +3,10 @@
   ansible.builtin.package:
     name: "{{ 'apache2-utils' if ansible_facts.os_family == 'Debian' else 'httpd-tools' }}"
     state: present
+  register: _htpasswd_package
+  retries: 3                 # package mirrors fail now and then
+  delay: 15
+  until: _htpasswd_package is succeeded
 
 - name: Create the restic service user
   ansible.builtin.user:
@@ -52,6 +56,10 @@
         dest: "/root/.{{ _rest_tarball }}"
         checksum: "sha256:{{ fleet_rest_server_sha256[fleet_arch] }}"
         mode: "0600"
+      register: _rest_download
+      retries: 3
+      delay: 10
+      until: _rest_download is succeeded
 
     - name: Install the rest-server binary atomically
       ansible.builtin.shell: |

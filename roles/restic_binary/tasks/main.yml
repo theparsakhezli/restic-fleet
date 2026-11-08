@@ -15,6 +15,10 @@
         dest: "/root/.restic-{{ fleet_restic_version }}.bz2"
         checksum: "sha256:{{ fleet_restic_sha256[fleet_arch] }}"
         mode: "0600"
+      register: _restic_download
+      retries: 3
+      delay: 10
+      until: _restic_download is succeeded
 
     - name: Unpack and install restic atomically
       ansible.builtin.shell: |

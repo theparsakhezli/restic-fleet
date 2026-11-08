@@ -52,7 +52,10 @@ ok "SSH keys installed"
 
 step "Prepare test data"
 node web1 "mkdir -p /srv/app/cache && echo 'important' > /srv/app/data.txt && echo 'skip me' > /srv/app/cache/tmp.txt"
-node db1 "apt-get update -qq && apt-get install -y -qq postgresql >/dev/null 2>&1 && systemctl start postgresql \
+# --error-on=any: a mirror hiccup must fail the attempt (plain apt-get update exits 0), then retry
+node db1 "for i in 1 2 3; do apt-get update -qq --error-on=any && apt-get install -y -qq postgresql >/dev/null 2>&1 && exit 0; sleep 10; done; exit 1" \
+  || die "could not install PostgreSQL on db1 (package mirror unreachable?)"
+node db1 "systemctl start postgresql \
   && runuser -u postgres -- psql -qc \"CREATE DATABASE appdb\" \
   && runuser -u postgres -- psql -q appdb -c \"CREATE TABLE fleet_test (id int, note text); INSERT INTO fleet_test VALUES (1, 'restore-me');\""
 ok "web1 files and db1 PostgreSQL database created"

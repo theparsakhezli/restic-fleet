@@ -38,6 +38,12 @@ All notable changes to restic-fleet are listed here. The format follows
 
 ### Fixed
 
+- A single package-mirror or GitHub download hiccup no longer fails a deploy: package installs and
+  the restic/rest-server downloads are retried. On hosts without `python3-apt`, Ansible installs it
+  after an `apt-get update` that exits 0 even when nothing was downloaded, which used to fail with
+  "Unable to locate package python3-apt".
+- The e2e test image includes `python3-apt` (as Ubuntu server images do), and its apt steps retry
+  and fail on any download error; CI runs both Ansible versions to the end (`fail-fast: false`).
 - A path in `backup_paths` that doesn't exist now fails the files job and the systemd unit (it was
   a warning, and systemd reported success).
 

@@ -9,16 +9,27 @@
       in '{{ fleet_client_group }}'.
   run_once: true
 
+# Package mirrors fail now and then, so installs are retried. On hosts without python3-apt, Ansible
+# installs it after a single `apt-get update` that exits 0 even when nothing could be downloaded;
+# a retry runs that again instead of failing the whole deploy on one network hiccup.
 - name: Install base packages (Debian/Ubuntu)
   ansible.builtin.apt:
     name: "{{ fleet_packages_debian }}"
     state: present
     update_cache: true
     cache_valid_time: 3600
+  register: _base_packages
+  retries: 3
+  delay: 15
+  until: _base_packages is succeeded
   when: ansible_facts.os_family == "Debian"
 
 - name: Install base packages (RHEL family)
   ansible.builtin.dnf:
     name: "{{ fleet_packages_redhat }}"
     state: present
+  register: _base_packages_rh
+  retries: 3
+  delay: 15
+  until: _base_packages_rh is succeeded
   when: ansible_facts.os_family == "RedHat"
