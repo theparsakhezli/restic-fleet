@@ -33,8 +33,10 @@ case "${1:-help}" in
     exec journalctl -u restic-fleet-backup.service --no-pager -n 200 "$@" ;;
   db)
     name=${2:?usage: rfleet db NAME [SNAPSHOT] > file}
-    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ -f "/etc/restic-fleet/dumps/$name.filename" ] \
-      || { echo "no database job named '$name'" >&2; exit 2; }
+    if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || [ ! -f "/etc/restic-fleet/dumps/$name.filename" ]; then
+      echo "no database job named '$name'" >&2
+      exit 2
+    fi
     exec restic dump --tag "$name" "${3:-latest}" "/$(cat "/etc/restic-fleet/dumps/$name.filename")" ;;
   restore)
     # restic overwrites existing files at the target by default. Restoring straight over the live
